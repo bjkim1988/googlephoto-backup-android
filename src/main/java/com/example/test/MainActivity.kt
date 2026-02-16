@@ -152,17 +152,17 @@ fun SynologyDownloaderApp(repository: SynologyRepository) {
     }
 
     // Queue processor
-    LaunchedEffect(backupQueue, isBackupRunning) {
-        if (backupQueue.isNotEmpty() && !isBackupRunning) {
-            val job = backupQueue.first()
+    LaunchedEffect(Unit) {
+        snapshotFlow { backupQueue to isBackupRunning }
+            .collect { (queue, running) ->
+                if (queue.isNotEmpty() && !running) {
+            val job = queue.first()
             backupQueue = backupQueue.drop(1)
             isBackupRunning = true
             currentBackupLabel = job.label
             
             try {
                 val maxBytes = 50 * 1024 * 1024L
-                val nasDir = File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS), "nas")
-                if (!nasDir.exists()) nasDir.mkdirs()
                 
                 val jobSourcePath = when (job) {
                     is BackupJob.RecursiveBackup -> job.sourcePath
@@ -198,7 +198,20 @@ fun SynologyDownloaderApp(repository: SynologyRepository) {
                     for (file in candidateFiles) {
                         if (plannedDownloadBytes >= maxBytes) break
                         val remoteSize = file.additional?.size ?: 0L
-                        val targetFile = File(nasDir, file.name)
+                        // Only download image and video files
+                        val ext = file.name.substringAfterLast('.', "").lowercase()
+                        val imageExtensions = setOf("jpg", "jpeg", "png", "gif", "bmp", "webp", "heic", "heif", "tiff", "svg", "raw", "cr2", "nef", "arw", "dng")
+                        val videoExtensions = setOf("mp4", "mov", "avi", "mkv", "wmv", "flv", "webm", "m4v", "3gp", "mpeg", "mpg")
+                        if (ext !in imageExtensions && ext !in videoExtensions) continue
+                        // Compute local subdirectory mirroring NAS folder structure
+                        val parentPath = file.path.substringBeforeLast('/')
+                        val localSubDir = if (parentPath.length > "/photo".length) {
+                            "nas" + parentPath.substring("/photo".length)
+                        } else {
+                            "nas"
+                        }
+                        val localDir = File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS), localSubDir)
+                        val targetFile = File(localDir, file.name)
                         if (targetFile.exists() && targetFile.length() == remoteSize) continue
                         filesToDownload.add(file)
                         plannedDownloadBytes += remoteSize
@@ -223,7 +236,14 @@ fun SynologyDownloaderApp(repository: SynologyRepository) {
                             val stream = repository.downloadFile(file.path)
                             if (stream != null) {
                                 val context2 = context
-                                val success = saveToMediaStore(context2, stream, file.name, "nas", remoteSize)
+                                // Compute local subDir mirroring NAS folder tree
+                                val fileParentPath = file.path.substringBeforeLast('/')
+                                val localSubDir = if (fileParentPath.length > "/photo".length) {
+                                    "nas" + fileParentPath.substring("/photo".length)
+                                } else {
+                                    "nas"
+                                }
+                                val success = saveToMediaStore(context2, stream, file.name, localSubDir, remoteSize)
                                 
                                 if (success) {
                                     currentDownloadedBytes += remoteSize
@@ -347,6 +367,7 @@ fun SynologyDownloaderApp(repository: SynologyRepository) {
             } finally {
                 isBackupRunning = false
                 currentBackupLabel = ""
+            }
             }
         }
     }
