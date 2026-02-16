@@ -202,7 +202,14 @@ fun SynologyDownloaderApp(repository: SynologyRepository) {
             currentBackupLabel = job.label
             
             activeBackupJob = scope.launch {
-            try {
+                val powerManager = context.getSystemService(Context.POWER_SERVICE) as? android.os.PowerManager
+                val wakeLock = powerManager?.newWakeLock(android.os.PowerManager.PARTIAL_WAKE_LOCK, "SynologyDownloader::Backup")
+                if (wakeLock != null) {
+                    wakeLock.acquire(10 * 60 * 60 * 1000L) // 10 hours max
+                    appendLog(context, "WakeLock acquired")
+                }
+
+                try {
                 val maxBytes = 50 * 1024 * 1024L
                 
                 val jobSourcePath = when (job) {
@@ -215,7 +222,14 @@ fun SynologyDownloaderApp(repository: SynologyRepository) {
                 statusMessage = "Running: ${job.label}"
                 
                 withContext(Dispatchers.IO) {
-                val maxBytes = 50 * 1024 * 1024L
+                val freeSpace = Environment.getExternalStorageDirectory().freeSpace
+                val reservedSpace = 10L * 1024 * 1024 * 1024 // 10GB
+                val maxBytes = if (freeSpace > reservedSpace) freeSpace - reservedSpace else 0L
+                withContext(Dispatchers.Main) {
+                    val freeGB = String.format("%.2f", freeSpace / (1024.0 * 1024.0 * 1024.0))
+                    val limitMB = String.format("%.2f", maxBytes / (1024.0 * 1024.0))
+                    debugLog += "Storage: ${freeGB}GB free. Reserving 10GB. Batch Limit: ${limitMB}MB\n"
+                }
                 
                 // Get files to process
                 val candidateFiles = when (job) {
@@ -458,6 +472,10 @@ fun SynologyDownloaderApp(repository: SynologyRepository) {
                 debugLog += "Queue job error: ${e.message}\n"
                 appendLog(context, "Queue job error: ${e.message}")
             } finally {
+                if (wakeLock?.isHeld == true) {
+                    wakeLock.release()
+                    appendLog(context, "WakeLock released")
+                }
                 isBackupRunning = false
                 currentBackupLabel = ""
             }
