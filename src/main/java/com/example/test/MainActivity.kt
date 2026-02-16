@@ -928,27 +928,34 @@ fun SynologyDownloaderApp(repository: SynologyRepository) {
                         Column(modifier = Modifier.padding(12.dp)) {
                             // 1. Running Status
                             if (isBackupRunning) {
-                                Text("Running:", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.primary)
-                                Spacer(modifier = Modifier.height(4.dp))
-                                Text(
-                                    text = currentBackupLabel,
-                                    style = MaterialTheme.typography.titleSmall,
-                                    fontWeight = FontWeight.Bold,
-                                    maxLines = 1,
-                                    overflow = TextOverflow.Ellipsis
-                                )
-                                Spacer(modifier = Modifier.height(8.dp))
-                                
-                                Button(
-                                    onClick = { 
-                                        activeBackupJob?.cancel()
-                                        backupQueue = emptyList()
-                                        statusMessage = "Cancelled"
-                                    },
-                                    colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error),
-                                    modifier = Modifier.fillMaxWidth()
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.SpaceBetween
                                 ) {
-                                    Text("Stop Backups & Clear Queue")
+                                    Column(modifier = Modifier.weight(1f).padding(end = 8.dp)) {
+                                        Text("Running:", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.primary)
+                                        Text(
+                                            text = currentBackupLabel,
+                                            style = MaterialTheme.typography.titleSmall,
+                                            fontWeight = FontWeight.Bold,
+                                            maxLines = if (isQueueExpanded) Int.MAX_VALUE else 1,
+                                            overflow = TextOverflow.Ellipsis
+                                        )
+                                    }
+                                    
+                                    Button(
+                                        onClick = { 
+                                            activeBackupJob?.cancel()
+                                            backupQueue = emptyList()
+                                            statusMessage = "Cancelled"
+                                        },
+                                        colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error),
+                                        contentPadding = PaddingValues(horizontal = 12.dp, vertical = 0.dp),
+                                        modifier = Modifier.height(32.dp)
+                                    ) {
+                                        Text("Stop")
+                                    }
                                 }
                             }
 
@@ -1123,12 +1130,28 @@ fun SynologyDownloaderApp(repository: SynologyRepository) {
                     title = { Text("Non-Media Files Found") },
                     text = {
                         Column {
-                            Text("Found ${leftoverFiles.size} files that were skipped (not image/video). Delete them from NAS?")
-                            LazyColumn(modifier = Modifier.heightIn(max = 300.dp)) {
+                            Text("Found ${leftoverFiles.size} files that were skipped (not image/video).")
+                            Spacer(modifier = Modifier.height(8.dp))
+                            Text("The list below shows files found in folders we backed up. You can choose to delete them from the NAS.")
+                            Spacer(modifier = Modifier.height(8.dp))
+                            
+                            HorizontalDivider()
+                            LazyColumn(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .heightIn(max = 400.dp)
+                                    .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.3f))
+                            ) {
                                 items(leftoverFiles) { file ->
-                                    Text(file.name, style = MaterialTheme.typography.bodySmall, modifier = Modifier.padding(vertical=2.dp))
+                                    Text(
+                                        file.name,
+                                        style = MaterialTheme.typography.bodySmall, 
+                                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp)
+                                    )
+                                    HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f))
                                 }
                             }
+                            HorizontalDivider()
                         }
                     },
                     confirmButton = {
@@ -1177,6 +1200,7 @@ fun SynologyDownloaderApp(repository: SynologyRepository) {
             }
         }
     }
+}
 
 /**
  * Checks if a file exists in the Downloads/subDir folder using MediaStore.
