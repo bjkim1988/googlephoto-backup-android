@@ -823,14 +823,52 @@ fun SynologyDownloaderApp(repository: SynologyRepository) {
             Spacer(modifier = Modifier.height(16.dp))
             Text(text = statusMessage)
             Spacer(modifier = Modifier.height(8.dp))
-            Text(text = "Debug Log:", style = MaterialTheme.typography.titleSmall)
-            OutlinedTextField(
-                value = debugLog,
-                onValueChange = {},
-                readOnly = true,
-                modifier = Modifier.fillMaxWidth().weight(1f).padding(top = 8.dp),
-                textStyle = LocalTextStyle.current.copy(fontSize = TextUnit.Unspecified)
-            )
+            
+            // Debug Log UI
+            var showDebugLog by remember { mutableStateOf(false) }
+            Button(onClick = { showDebugLog = !showDebugLog }, modifier = Modifier.fillMaxWidth().padding(vertical=4.dp)) {
+                Text(if (showDebugLog) "Hide Debug Log" else "Show Debug Log")
+            }
+            
+            if (showDebugLog) {
+                val scrollState = rememberScrollState()
+                
+                LaunchedEffect(Unit) {
+                    delay(100)
+                    scrollState.scrollTo(Int.MAX_VALUE)
+                }
+                
+                LaunchedEffect(scrollState.maxValue) {
+                    if (scrollState.maxValue > 0) {
+                         val dist = scrollState.maxValue - scrollState.value
+                         if (dist < 200) {
+                              scrollState.scrollTo(scrollState.maxValue)
+                         }
+                    }
+                }
+                
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(200.dp)
+                        .background(MaterialTheme.colorScheme.inverseOnSurface)
+                        .border(1.dp, MaterialTheme.colorScheme.outlineVariant)
+                        .verticalScroll(scrollState)
+                        .padding(8.dp)
+                ) {
+                    SelectionContainer {
+                        Text(
+                            text = debugLog,
+                            style = MaterialTheme.typography.bodySmall.copy(
+                                fontFamily = FontFamily.Monospace,
+                                fontSize = 11.sp,
+                                lineHeight = 14.sp
+                            ),
+                            color = MaterialTheme.colorScheme.onSurface
+                        )
+                    }
+                }
+            }
 
         } else {
             OutlinedTextField(
@@ -972,10 +1010,18 @@ fun SynologyDownloaderApp(repository: SynologyRepository) {
                     
                     Button(onClick = {
                         val files = selectedFiles.filter { !it.isdir }.toList()
-                        backupQueue = backupQueue + BackupJob.SelectedBackup(files, sourcePath)
-                        statusMessage = "Queued: ${files.size} files (Queue: ${backupQueue.size})"
-                        isSelectionMode = false
-                        selectedFiles = emptySet()
+                        val newJob = BackupJob.SelectedBackup(files, sourcePath)
+                        
+                        if (isBackupRunning && currentBackupLabel == newJob.label) {
+                            Toast.makeText(context, "Task is currently running!", Toast.LENGTH_SHORT).show()
+                        } else if (backupQueue.any { it.label == newJob.label }) {
+                             Toast.makeText(context, "Task is already in queue!", Toast.LENGTH_SHORT).show()
+                        } else {
+                            backupQueue = backupQueue + newJob
+                            statusMessage = "Queued: ${files.size} files (Queue: ${backupQueue.size})"
+                            isSelectionMode = false
+                            selectedFiles = emptySet()
+                        }
                     }, modifier = Modifier.weight(1f)) {
                         Text("Backup (${selectedFiles.size})")
                     }
@@ -983,8 +1029,16 @@ fun SynologyDownloaderApp(repository: SynologyRepository) {
             } else {
                 Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
                 Button(onClick = {
-                    backupQueue = backupQueue + BackupJob.RecursiveBackup(sourcePath)
-                    statusMessage = "Queued: Full Backup of $sourcePath (Queue: ${backupQueue.size})"
+                    val newJob = BackupJob.RecursiveBackup(sourcePath)
+                    
+                    if (isBackupRunning && currentBackupLabel == newJob.label) {
+                        Toast.makeText(context, "Task is currently running!", Toast.LENGTH_SHORT).show()
+                    } else if (backupQueue.any { it.label == newJob.label }) {
+                         Toast.makeText(context, "Task is already in queue!", Toast.LENGTH_SHORT).show()
+                    } else {
+                        backupQueue = backupQueue + newJob
+                        statusMessage = "Queued: Full Backup of $sourcePath (Queue: ${backupQueue.size})"
+                    }
                 }) {
                     Text("Start Backup")
                 }
@@ -1216,16 +1270,21 @@ fun SynologyDownloaderApp(repository: SynologyRepository) {
                 
                 if (showDebugLog) {
                     val scrollState = rememberScrollState()
+                    
+                    // Initial scroll to bottom
                     LaunchedEffect(Unit) {
                         delay(100) // Wait for initial layout
                         scrollState.scrollTo(Int.MAX_VALUE)
                     }
-                    LaunchedEffect(debugLog) {
-                        scrollState.scrollTo(Int.MAX_VALUE)
-                    }
+                    
+                    // Smart auto-scroll: Only scroll if user is already at the bottom
                     LaunchedEffect(scrollState.maxValue) {
                         if (scrollState.maxValue > 0) {
-                             scrollState.scrollTo(scrollState.maxValue)
+                             val dist = scrollState.maxValue - scrollState.value
+                             // Threshold: 200px. If close to bottom, update to new bottom.
+                             if (dist < 200) {
+                                  scrollState.scrollTo(scrollState.maxValue)
+                             }
                         }
                     }
                     
