@@ -44,7 +44,12 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.withContext
 import java.io.File
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.TextButton
+import androidx.compose.foundation.layout.heightIn
 import java.io.FileOutputStream
 import java.io.InputStream
 
@@ -103,6 +108,9 @@ fun SynologyDownloaderApp(repository: SynologyRepository) {
     var debugLog by remember { mutableStateOf("") }
     var isLoggedIn by remember { mutableStateOf(false) }
     
+    var isSelectionMode by remember { mutableStateOf(false) }
+    var selectedFiles by remember { mutableStateOf<Set<FileInfo>>(emptySet()) }
+    
     // Login step: 1 = NAS Address, 2 = Username, 3 = Password, 4 = OTP
     var loginStep by remember { mutableStateOf(
         if (savedHost.isNotBlank() && savedHost != "https://your-nas-address:5001" && savedUser.isNotBlank()) 3 else 1
@@ -119,6 +127,11 @@ fun SynologyDownloaderApp(repository: SynologyRepository) {
     var backupQueue by remember { mutableStateOf<List<BackupJob>>(emptyList()) }
     var isBackupRunning by remember { mutableStateOf(false) }
     var currentBackupLabel by remember { mutableStateOf("") }
+    var activeBackupJob by remember { mutableStateOf<Job?>(null) }
+    
+    // Leftover files handling
+    var leftoverFiles by remember { mutableStateOf<List<FileInfo>>(emptyList()) }
+    var showLeftoverDialog by remember { mutableStateOf(false) }
     
     val launcher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
@@ -178,6 +191,7 @@ fun SynologyDownloaderApp(repository: SynologyRepository) {
             isBackupRunning = true
             currentBackupLabel = job.label
             
+            activeBackupJob = scope.launch {
             try {
                 val maxBytes = 50 * 1024 * 1024L
                 
@@ -190,36 +204,59 @@ fun SynologyDownloaderApp(repository: SynologyRepository) {
                 statusMessage = "Running: ${job.label}"
                 
                 withContext(Dispatchers.IO) {
-                    // Get files to process
-                    val candidateFiles = when (job) {
-                        is BackupJob.RecursiveBackup -> {
-                            withContext(Dispatchers.Main) {
-                                debugLog += "Scanning all subdirectories from ${job.sourcePath}...\n"
-                            }
-                            val files = repository.listFilesRecursive(job.sourcePath) { scanningPath ->
-                                withContext(Dispatchers.Main) {
-                                    statusMessage = "Scanning: $scanningPath"
-                                }
-                            }
-                            withContext(Dispatchers.Main) {
-                                debugLog += "Found ${files.size} files total\n"
-                            }
-                            files
+                val maxBytes = 50 * 1024 * 1024L
+                
+                // Get files to process
+                val candidateFiles = when (job) {
+                    is BackupJob.RecursiveBackup -> {
+                        withContext(Dispatchers.Main) {
+                            debugLog += "Scanning all subdirectories from ${job.sourcePath}...\n"
                         }
-                        is BackupJob.SelectedBackup -> job.files
+                        val files = repository.listFilesRecursive(job.sourcePath) { scanningPath ->
+                            withContext(Dispatchers.Main) {
+                                statusMessage = "Scanning: $scanningPath"
+                            }
+                        }
+                        withContext(Dispatchers.Main) {
+                            debugLog += "Found ${files.size} files total\n"
+                        }
+                        files
                     }
-                    
-                    var plannedDownloadBytes = 0L
-                    val filesToDownload = mutableListOf<FileInfo>()
-                    
-                    for (file in candidateFiles) {
+                    is BackupJob.SelectedBackup -> job.files
+                }
+
+                // Identify files to process (images/videos) vs leftovers
+                val imageExtensions = setOf("jpg", "jpeg", "png", "gif", "bmp", "webp", "heic", "heif", "tiff", "svg", "raw", "cr2", "nef", "arw", "dng")
+                val videoExtensions = setOf("mp4", "mov", "avi", "mkv", "wmv", "flv", "webm", "m4v", "3gp", "mpeg", "mpg")
+
+                val filesToDownload = mutableListOf<FileInfo>()
+                val nonMediaFiles = mutableListOf<FileInfo>()
+                
+                var plannedDownloadBytes = 0L
+                
+                for (file in candidateFiles) {
+                     val ext = file.name.substringAfterLast('.', "").lowercase()
+                     if (ext in imageExtensions || ext in videoExtensions) {
+                         // Check size/existence logic
+                         val remoteSize = file.additional?.size ?: 0L
+                         // Compute local path (simplified check here, detailed in loop)
+                         // We just filter based on type for now, existence check is done inside or here.
+                         // Let's reuse existing existence logic if possible, or move it here.
+                         // To keep it simple and safe, we just check extension here for splitting.
+                         // But we must also check existence to filter out ALREADY BACKED UP files from filesToDownload.
+                         // Leftovers are simply those that are NOT media.
+                         // Be careful: if a file is media but already backed up, it is NOT a leftover.
+                         filesToDownload.add(file)
+                     } else {
+                         nonMediaFiles.add(file)
+                     }
+                }
+                
+                // Filter filesToDownload for existence/size limits
+                val realFilesToDownload = mutableListOf<FileInfo>()
+                 for (file in filesToDownload) {
                         if (plannedDownloadBytes >= maxBytes) break
                         val remoteSize = file.additional?.size ?: 0L
-                        // Only download image and video files
-                        val ext = file.name.substringAfterLast('.', "").lowercase()
-                        val imageExtensions = setOf("jpg", "jpeg", "png", "gif", "bmp", "webp", "heic", "heif", "tiff", "svg", "raw", "cr2", "nef", "arw", "dng")
-                        val videoExtensions = setOf("mp4", "mov", "avi", "mkv", "wmv", "flv", "webm", "m4v", "3gp", "mpeg", "mpg")
-                        if (ext !in imageExtensions && ext !in videoExtensions) continue
                         // Compute local subdirectory mirroring NAS folder structure
                         val parentPath = file.path.substringBeforeLast('/')
                         val localSubDir = if (parentPath.length > "/photo".length) {
@@ -230,24 +267,29 @@ fun SynologyDownloaderApp(repository: SynologyRepository) {
                         val localDir = File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS), localSubDir)
                         val targetFile = File(localDir, file.name)
                         if (targetFile.exists() && targetFile.length() == remoteSize) continue
-                        filesToDownload.add(file)
+                        
+                        realFilesToDownload.add(file)
                         plannedDownloadBytes += remoteSize
                     }
                     
                     withContext(Dispatchers.Main) {
-                        debugLog += "Backup Plan: ${filesToDownload.size} files, approx ${plannedDownloadBytes / 1024} KB\n"
+                        debugLog += "Backup Plan: ${realFilesToDownload.size} files, approx ${plannedDownloadBytes / 1024} KB\n"
+                        if (nonMediaFiles.isNotEmpty()) {
+                            leftoverFiles = nonMediaFiles
+                            showLeftoverDialog = true
+                        }
                     }
                     
                     var currentDownloadedBytes = 0L
                     var filesDone = 0
                     
-                    for ((index, file) in filesToDownload.withIndex()) {
+                    for ((index, file) in realFilesToDownload.withIndex()) {
                         if (currentDownloadedBytes >= maxBytes) break
                         val remoteSize = file.additional?.size ?: 0L
                         
                         try {
                             withContext(Dispatchers.Main) {
-                                statusMessage = "Downloading (${index + 1}/${filesToDownload.size}): ${file.name}"
+                                statusMessage = "Downloading (${index + 1}/${realFilesToDownload.size}): ${file.name}"
                             }
                             
                             val stream = repository.downloadFile(file.path)
@@ -374,7 +416,7 @@ fun SynologyDownloaderApp(repository: SynologyRepository) {
                         val totalMB = currentDownloadedBytes / (1024 * 1024)
                         statusMessage = "Done: $filesDone files ($totalMB MB). Queue: ${backupQueue.size} remaining"
                         debugLog += "=== Job complete: ${job.label} ===\n"
-                        refreshList(jobSourcePath)
+                        refreshList(sourcePath)
                     }
                 }
             } catch (e: Exception) {
@@ -382,6 +424,7 @@ fun SynologyDownloaderApp(repository: SynologyRepository) {
             } finally {
                 isBackupRunning = false
                 currentBackupLabel = ""
+            }
             }
             }
         }
@@ -883,31 +926,64 @@ fun SynologyDownloaderApp(repository: SynologyRepository) {
                         colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.primaryContainer)
                     ) {
                         Column(modifier = Modifier.padding(12.dp)) {
-                            Row(
-                                modifier = Modifier.fillMaxWidth(),
-                                verticalAlignment = Alignment.CenterVertically,
-                                horizontalArrangement = Arrangement.SpaceBetween
-                            ) {
-                                Column(modifier = Modifier.weight(1f)) {
-                                    if (isBackupRunning) {
-                                        Text("▶ Running: $currentBackupLabel", style = MaterialTheme.typography.bodySmall, fontWeight = FontWeight.Bold, maxLines = if (isQueueExpanded) Int.MAX_VALUE else 1, overflow = TextOverflow.Ellipsis)
-                                    }
-                                    if (backupQueue.isNotEmpty()) {
-                                        Text("Queue: ${backupQueue.size} pending" + if(isQueueExpanded) " (Tap to collapse)" else " (Tap to expand)", style = MaterialTheme.typography.labelSmall)
-                                    }
+                            // 1. Running Status
+                            if (isBackupRunning) {
+                                Text("Running:", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.primary)
+                                Spacer(modifier = Modifier.height(4.dp))
+                                Text(
+                                    text = currentBackupLabel,
+                                    style = MaterialTheme.typography.titleSmall,
+                                    fontWeight = FontWeight.Bold,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                                Spacer(modifier = Modifier.height(8.dp))
+                                
+                                Button(
+                                    onClick = { 
+                                        activeBackupJob?.cancel()
+                                        backupQueue = emptyList()
+                                        statusMessage = "Cancelled"
+                                    },
+                                    colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error),
+                                    modifier = Modifier.fillMaxWidth()
+                                ) {
+                                    Text("Stop Backups & Clear Queue")
                                 }
-                                if (backupQueue.isNotEmpty() && !isQueueExpanded) {
-                                    Button(
-                                        onClick = { backupQueue = emptyList() },
-                                        colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error),
-                                        contentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp),
-                                        modifier = Modifier.height(28.dp)
-                                    ) {
-                                        Text("Clear", fontSize = 12.sp)
+                            }
+
+                            // 2. Queue Status
+                            if (backupQueue.isNotEmpty()) {
+                                if (isBackupRunning) {
+                                    Spacer(modifier = Modifier.height(12.dp))
+                                    HorizontalDivider(color = MaterialTheme.colorScheme.onPrimaryContainer.copy(alpha = 0.2f))
+                                    Spacer(modifier = Modifier.height(12.dp))
+                                }
+                                
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.SpaceBetween,
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Text(
+                                        text = "Pending: ${backupQueue.size} jobs" + if(isQueueExpanded) "" else " (Tap for details)",
+                                        style = MaterialTheme.typography.bodyMedium
+                                    )
+                                    
+                                    if (!isQueueExpanded) {
+                                         Button(
+                                            onClick = { backupQueue = emptyList() },
+                                            colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error),
+                                            contentPadding = PaddingValues(horizontal = 12.dp, vertical = 0.dp),
+                                            modifier = Modifier.height(32.dp)
+                                        ) {
+                                            Text("Clear", fontSize = 12.sp)
+                                        }
                                     }
                                 }
                             }
                             
+                            // 3. Expanded List
                             if (isQueueExpanded && backupQueue.isNotEmpty()) {
                                 Spacer(modifier = Modifier.height(8.dp))
                                 HorizontalDivider(color = MaterialTheme.colorScheme.onPrimaryContainer.copy(alpha = 0.2f))
@@ -937,7 +1013,7 @@ fun SynologyDownloaderApp(repository: SynologyRepository) {
 
 
             LazyColumn(modifier = Modifier.weight(1f)) {
-                if (sourcePath != "/" && sourcePath.isNotEmpty()) {
+                if (sourcePath != "/" && sourcePath != "/photo" && sourcePath.isNotEmpty()) {
                     item {
                         Row(
                             modifier = Modifier
@@ -1023,24 +1099,84 @@ fun SynologyDownloaderApp(repository: SynologyRepository) {
             Text(text = statusMessage, modifier = Modifier.padding(top = 8.dp))
             
             // Debug Log Visibility Toggle
-            var showDebugLog by remember { mutableStateOf(false) }
-            
-            Button(onClick = { showDebugLog = !showDebugLog }, modifier = Modifier.fillMaxWidth().padding(vertical=4.dp)) {
-                Text(if (showDebugLog) "Hide Debug Log" else "Show Debug Log")
+            if (isLoggedIn) {
+                var showDebugLog by remember { mutableStateOf(false) }
+                
+                Button(onClick = { showDebugLog = !showDebugLog }, modifier = Modifier.fillMaxWidth().padding(vertical=4.dp)) {
+                    Text(if (showDebugLog) "Hide Debug Log" else "Show Debug Log")
+                }
+                
+                if (showDebugLog) {
+                    OutlinedTextField(
+                        value = debugLog,
+                        onValueChange = {},
+                        readOnly = true,
+                        modifier = Modifier.fillMaxWidth().height(150.dp).padding(vertical = 4.dp),
+                        textStyle = LocalTextStyle.current.copy(fontSize = TextUnit.Unspecified)
+                    )
+                }
             }
             
-            if (showDebugLog) {
-                OutlinedTextField(
-                    value = debugLog,
-                    onValueChange = {},
-                    readOnly = true,
-                    modifier = Modifier.fillMaxWidth().height(150.dp).padding(vertical = 4.dp),
-                    textStyle = LocalTextStyle.current.copy(fontSize = TextUnit.Unspecified)
+            if (showLeftoverDialog) {
+                AlertDialog(
+                    onDismissRequest = { showLeftoverDialog = false },
+                    title = { Text("Non-Media Files Found") },
+                    text = {
+                        Column {
+                            Text("Found ${leftoverFiles.size} files that were skipped (not image/video). Delete them from NAS?")
+                            LazyColumn(modifier = Modifier.heightIn(max = 300.dp)) {
+                                items(leftoverFiles) { file ->
+                                    Text(file.name, style = MaterialTheme.typography.bodySmall, modifier = Modifier.padding(vertical=2.dp))
+                                }
+                            }
+                        }
+                    },
+                    confirmButton = {
+                        TextButton(
+                            onClick = {
+                                showLeftoverDialog = false
+                                scope.launch {
+                                    statusMessage = "Deleting leftovers..."
+                                    var delCount = 0
+                                    var deletedDirs = 0
+                                    val parentDirsToCheck = mutableSetOf<String>()
+                                    
+                                    withContext(Dispatchers.IO) {
+                                        // 1. Delete Files
+                                        leftoverFiles.forEach { file ->
+                                            if (repository.deleteFile(file.path) == "Success") {
+                                                delCount++
+                                                val parent = file.path.substringBeforeLast('/')
+                                                if (parent.isNotEmpty() && parent != "/") {
+                                                    parentDirsToCheck.add(parent)
+                                                }
+                                            }
+                                        }
+                                        
+                                        // 2. Check and Delete Empty Directories
+                                        parentDirsToCheck.forEach { dir ->
+                                            val contents = repository.listFiles(dir)
+                                            if (contents.isEmpty()) {
+                                                if (repository.deleteFile(dir) == "Success") {
+                                                    deletedDirs++
+                                                }
+                                            }
+                                        }
+                                    }
+                                    statusMessage = "Deleted $delCount files and $deletedDirs empty folders."
+                                    refreshList(sourcePath)
+                                }
+                            },
+                             colors = ButtonDefaults.textButtonColors(contentColor = MaterialTheme.colorScheme.error)
+                        ) { Text("Delete All") }
+                    },
+                    dismissButton = {
+                        TextButton(onClick = { showLeftoverDialog = false }) { Text("Keep") }
+                    }
                 )
             }
         }
     }
-}
 
 /**
  * Checks if a file exists in the Downloads/subDir folder using MediaStore.
