@@ -17,6 +17,11 @@ import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.foundation.text.selection.SelectionContainer
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.text.KeyboardOptions
@@ -134,6 +139,7 @@ fun SynologyDownloaderApp(repository: SynologyRepository) {
     // Leftover files handling
     var leftoverFiles by remember { mutableStateOf<List<FileInfo>>(emptyList()) }
     var showLeftoverDialog by remember { mutableStateOf(false) }
+    var showStorageErrorDialog by remember { mutableStateOf(false) }
     
     val launcher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
@@ -225,6 +231,16 @@ fun SynologyDownloaderApp(repository: SynologyRepository) {
                 val freeSpace = Environment.getExternalStorageDirectory().freeSpace
                 val reservedSpace = 10L * 1024 * 1024 * 1024 // 10GB
                 val maxBytes = if (freeSpace > reservedSpace) freeSpace - reservedSpace else 0L
+                
+                if (maxBytes <= 0) {
+                    withContext(Dispatchers.Main) {
+                        statusMessage = "Error: Storage full (<10GB free)"
+                        showStorageErrorDialog = true
+                        debugLog += "Error: Insufficient storage (Require > 10GB free)\n"
+                    }
+                    throw Exception("Insufficient storage (<10GB free)")
+                }
+
                 withContext(Dispatchers.Main) {
                     val freeGB = String.format("%.2f", freeSpace / (1024.0 * 1024.0 * 1024.0))
                     val limitMB = String.format("%.2f", maxBytes / (1024.0 * 1024.0))
@@ -325,7 +341,14 @@ fun SynologyDownloaderApp(repository: SynologyRepository) {
                         
                         try {
                             withContext(Dispatchers.Main) {
-                                statusMessage = "Downloading (${index + 1}/${realFilesToDownload.size}): ${file.name} ($sizeStr)"
+                                val currentMB = currentDownloadedBytes / (1024.0 * 1024.0)
+                                val totalMB = plannedDownloadBytes / (1024.0 * 1024.0)
+                                val progressStr = if (totalMB > 921.6) { // 0.9 GB * 1024 MB/GB = 921.6 MB
+                                    String.format("%.2f/%.2f GB", currentMB / 1024.0, totalMB / 1024.0)
+                                } else {
+                                    String.format("%.1f/%.1f MB", currentMB, totalMB)
+                                }
+                                statusMessage = "Downloading ${index + 1}/${realFilesToDownload.size} ($progressStr): ${file.name} ($sizeStr)"
                                 debugLog += "Start: ${file.name} ($sizeStr)\n"
                             }
                             
@@ -1079,7 +1102,55 @@ fun SynologyDownloaderApp(repository: SynologyRepository) {
                 }
             }
 
-
+            Spacer(modifier = Modifier.height(8.dp))
+            Text(text = statusMessage, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.primary)
+            
+            // Debug Log UI with Auto-Scroll
+            if (isLoggedIn || debugLog.isNotEmpty()) {
+                var showDebugLog by remember { mutableStateOf(false) }
+                
+                Button(onClick = { showDebugLog = !showDebugLog }, modifier = Modifier.fillMaxWidth().padding(vertical=4.dp)) {
+                    Text(if (showDebugLog) "Hide Debug Log" else "Show Debug Log")
+                }
+                
+                if (showDebugLog) {
+                    val scrollState = rememberScrollState()
+                    LaunchedEffect(Unit) {
+                        delay(100) // Wait for initial layout
+                        scrollState.scrollTo(Int.MAX_VALUE)
+                    }
+                    LaunchedEffect(debugLog) {
+                        scrollState.scrollTo(Int.MAX_VALUE)
+                    }
+                    LaunchedEffect(scrollState.maxValue) {
+                        if (scrollState.maxValue > 0) {
+                             scrollState.scrollTo(scrollState.maxValue)
+                        }
+                    }
+                    
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(200.dp)
+                            .background(MaterialTheme.colorScheme.inverseOnSurface)
+                            .border(1.dp, MaterialTheme.colorScheme.outlineVariant)
+                            .verticalScroll(scrollState)
+                            .padding(8.dp)
+                    ) {
+                        SelectionContainer {
+                            Text(
+                                text = debugLog,
+                                style = MaterialTheme.typography.bodySmall.copy(
+                                    fontFamily = FontFamily.Monospace,
+                                    fontSize = 11.sp,
+                                    lineHeight = 14.sp
+                                ),
+                                color = MaterialTheme.colorScheme.onSurface
+                            )
+                        }
+                    }
+                }
+            }
             LazyColumn(modifier = Modifier.weight(1f)) {
                 if (sourcePath != "/" && sourcePath != "/photo" && sourcePath.isNotEmpty()) {
                     item {
@@ -1183,6 +1254,20 @@ fun SynologyDownloaderApp(repository: SynologyRepository) {
                         textStyle = LocalTextStyle.current.copy(fontSize = TextUnit.Unspecified)
                     )
                 }
+            }
+            
+            if (showStorageErrorDialog) {
+                AlertDialog(
+                    onDismissRequest = { showStorageErrorDialog = false },
+                    title = { Text("Storage Warning") },
+                    text = { Text("Backup cannot proceed because the device has less than 10GB of free space.\n\nPlease free up space and try again.") },
+                    confirmButton = {
+                        Button(onClick = { showStorageErrorDialog = false }) {
+                            Text("OK")
+                        }
+                    },
+                    icon = { Icon(Icons.Default.Info, contentDescription = null, tint = MaterialTheme.colorScheme.error) }
+                )
             }
             
             if (showLeftoverDialog) {
