@@ -38,6 +38,8 @@ import androidx.compose.ui.unit.TextUnit
 import com.example.test.network.FileInfo
 import com.example.test.repository.SynologyRepository
 import com.example.test.ui.theme.TestTheme
+import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -239,13 +241,13 @@ fun SynologyDownloaderApp(repository: SynologyRepository) {
                     var currentDownloadedBytes = 0L
                     var filesDone = 0
                     
-                    for (file in filesToDownload) {
+                    for ((index, file) in filesToDownload.withIndex()) {
                         if (currentDownloadedBytes >= maxBytes) break
                         val remoteSize = file.additional?.size ?: 0L
                         
                         try {
                             withContext(Dispatchers.Main) {
-                                statusMessage = "Downloading: ${file.name}"
+                                statusMessage = "Downloading (${index + 1}/${filesToDownload.size}): ${file.name}"
                             }
                             
                             val stream = repository.downloadFile(file.path)
@@ -281,7 +283,7 @@ fun SynologyDownloaderApp(repository: SynologyRepository) {
                                     
                                     withContext(Dispatchers.Main) {
                                         if (moveSuccess) {
-                                            debugLog += " - Move: Success\n"
+                                            debugLog += " - Move to $destFolder: Success\n"
                                         } else {
                                             debugLog += " - Move: Failed\n"
                                         }
@@ -312,9 +314,7 @@ fun SynologyDownloaderApp(repository: SynologyRepository) {
                                         }
                                     }
                                     
-                                    withContext(Dispatchers.Main) {
-                                        refreshList(jobSourcePath)
-                                    }
+
                                 } else {
                                     withContext(Dispatchers.Main) {
                                         debugLog += "Failed to save: ${file.name}\n"
@@ -846,52 +846,7 @@ fun SynologyDownloaderApp(repository: SynologyRepository) {
                     Text("Start Backup")
                 }
 
-                // Queue Status UI
-                if (isBackupRunning || backupQueue.isNotEmpty()) {
-                    Card(
-                        modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
-                        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.primaryContainer)
-                    ) {
-                        Column(modifier = Modifier.padding(12.dp)) {
-                            if (isBackupRunning) {
-                                Row(verticalAlignment = Alignment.CenterVertically) {
-                                    CircularProgressIndicator(
-                                        modifier = Modifier.size(16.dp),
-                                        strokeWidth = 2.dp
-                                    )
-                                    Spacer(modifier = Modifier.width(8.dp))
-                                    Text(
-                                        "▶ $currentBackupLabel",
-                                        style = MaterialTheme.typography.bodyMedium,
-                                        fontWeight = FontWeight.Bold
-                                    )
-                                }
-                            }
-                            if (backupQueue.isNotEmpty()) {
-                                Spacer(modifier = Modifier.height(4.dp))
-                                Text(
-                                    "Queue: ${backupQueue.size} pending",
-                                    style = MaterialTheme.typography.labelMedium,
-                                    color = MaterialTheme.colorScheme.onPrimaryContainer
-                                )
-                                backupQueue.forEachIndexed { index, job ->
-                                    Text(
-                                        "  ${index + 1}. ${job.label}",
-                                        style = MaterialTheme.typography.bodySmall
-                                    )
-                                }
-                                Spacer(modifier = Modifier.height(4.dp))
-                                Button(
-                                    onClick = { backupQueue = emptyList() },
-                                    modifier = Modifier.fillMaxWidth(),
-                                    colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error)
-                                ) {
-                                    Text("Clear Queue")
-                                }
-                            }
-                        }
-                    }
-                }
+
 
                     Button(onClick = {
                         scope.launch {
@@ -914,6 +869,68 @@ fun SynologyDownloaderApp(repository: SynologyRepository) {
                         }
                     }) {
                         Text("Download All")
+                    }
+                }
+
+                // Compact Queue Status UI (Expandable)
+                if (isBackupRunning || backupQueue.isNotEmpty()) {
+                    var isQueueExpanded by remember { mutableStateOf(false) }
+                    Card(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(top = 8.dp)
+                            .clickable { isQueueExpanded = !isQueueExpanded },
+                        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.primaryContainer)
+                    ) {
+                        Column(modifier = Modifier.padding(12.dp)) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.SpaceBetween
+                            ) {
+                                Column(modifier = Modifier.weight(1f)) {
+                                    if (isBackupRunning) {
+                                        Text("▶ Running: $currentBackupLabel", style = MaterialTheme.typography.bodySmall, fontWeight = FontWeight.Bold, maxLines = if (isQueueExpanded) Int.MAX_VALUE else 1, overflow = TextOverflow.Ellipsis)
+                                    }
+                                    if (backupQueue.isNotEmpty()) {
+                                        Text("Queue: ${backupQueue.size} pending" + if(isQueueExpanded) " (Tap to collapse)" else " (Tap to expand)", style = MaterialTheme.typography.labelSmall)
+                                    }
+                                }
+                                if (backupQueue.isNotEmpty() && !isQueueExpanded) {
+                                    Button(
+                                        onClick = { backupQueue = emptyList() },
+                                        colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error),
+                                        contentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp),
+                                        modifier = Modifier.height(28.dp)
+                                    ) {
+                                        Text("Clear", fontSize = 12.sp)
+                                    }
+                                }
+                            }
+                            
+                            if (isQueueExpanded && backupQueue.isNotEmpty()) {
+                                Spacer(modifier = Modifier.height(8.dp))
+                                HorizontalDivider(color = MaterialTheme.colorScheme.onPrimaryContainer.copy(alpha = 0.2f))
+                                Spacer(modifier = Modifier.height(8.dp))
+                                
+                                backupQueue.forEachIndexed { index, job ->
+                                    Text(
+                                        "${index + 1}. ${job.label}",
+                                        style = MaterialTheme.typography.bodySmall,
+                                        modifier = Modifier.padding(vertical = 2.dp)
+                                    )
+                                }
+                                
+                                Spacer(modifier = Modifier.height(8.dp))
+                                Button(
+                                    onClick = { backupQueue = emptyList() },
+                                    modifier = Modifier.fillMaxWidth(),
+                                    colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error)
+                                ) {
+                                    Text("Clear All Queue")
+                                }
+                            }
+                        }
                     }
                 }
             }
