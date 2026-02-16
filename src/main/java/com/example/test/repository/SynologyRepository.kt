@@ -29,7 +29,7 @@ class SynologyRepository {
         this.baseUrl = if (baseUrl.endsWith("/")) baseUrl else "$baseUrl/"
         
         val client = getUnsafeOkHttpClient().newBuilder()
-            .addInterceptor(HttpLoggingInterceptor().apply { setLevel(HttpLoggingInterceptor.Level.BODY) })
+            .addInterceptor(HttpLoggingInterceptor().apply { setLevel(HttpLoggingInterceptor.Level.HEADERS) })
             .build()
 
         val retrofit = Retrofit.Builder()
@@ -139,7 +139,7 @@ class SynologyRepository {
     suspend fun listFiles(folderPath: String): List<FileInfo> {
         return try {
             if (sid == null) return emptyList()
-            val response = api?.listFiles(folderPath = folderPath, additional = "size,time", sid = sid!!)
+            val response = api?.listFiles(folderPath = folderPath, additional = "[\"size\",\"time\"]", sid = sid!!)
             if (response?.isSuccessful == true && response.body()?.success == true) {
                 response.body()?.data?.files ?: emptyList()
             } else {

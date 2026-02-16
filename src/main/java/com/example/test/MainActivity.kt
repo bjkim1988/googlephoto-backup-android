@@ -16,6 +16,7 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.background
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.text.KeyboardOptions
@@ -90,6 +91,7 @@ sealed class BackupJob {
 @Composable
 fun SynologyDownloaderApp(repository: SynologyRepository) {
     val context = LocalContext.current
+    val activity = context as? Activity
     val scope = rememberCoroutineScope()
     
     // Plain prefs for non-sensitive data
@@ -137,6 +139,14 @@ fun SynologyDownloaderApp(repository: SynologyRepository) {
         ActivityResultContracts.RequestMultiplePermissions()
     ) {
         // Handle permissions
+    }
+
+    // Load last session log on startup
+    LaunchedEffect(Unit) {
+        val lastLog = withContext(Dispatchers.IO) { readLastLog(context) }
+        if (lastLog.isNotEmpty()) {
+            debugLog = "--- LAST SESSION LOG (Potential Crash Context) ---\n$lastLog\n--------------------------\n"
+        }
     }
 
     LaunchedEffect(Unit) {
@@ -201,6 +211,7 @@ fun SynologyDownloaderApp(repository: SynologyRepository) {
                 }
                 
                 debugLog += "=== Queue: Starting ${job.label} ===\n"
+                appendLog(context, "=== Queue: Starting ${job.label} ===")
                 statusMessage = "Running: ${job.label}"
                 
                 withContext(Dispatchers.IO) {
@@ -211,6 +222,7 @@ fun SynologyDownloaderApp(repository: SynologyRepository) {
                     is BackupJob.RecursiveBackup -> {
                         withContext(Dispatchers.Main) {
                             debugLog += "Scanning all subdirectories from ${job.sourcePath}...\n"
+                            appendLog(context, "Scanning all subdirectories from ${job.sourcePath}...")
                         }
                         val files = repository.listFilesRecursive(job.sourcePath) { scanningPath ->
                             withContext(Dispatchers.Main) {
@@ -219,6 +231,7 @@ fun SynologyDownloaderApp(repository: SynologyRepository) {
                         }
                         withContext(Dispatchers.Main) {
                             debugLog += "Found ${files.size} files total\n"
+                            appendLog(context, "Found ${files.size} files total")
                         }
                         files
                     }
@@ -274,6 +287,7 @@ fun SynologyDownloaderApp(repository: SynologyRepository) {
                     
                     withContext(Dispatchers.Main) {
                         debugLog += "Backup Plan: ${realFilesToDownload.size} files, approx ${plannedDownloadBytes / 1024} KB\n"
+                        appendLog(context, "Backup Plan: ${realFilesToDownload.size} files, approx ${plannedDownloadBytes / 1024} KB")
                         if (nonMediaFiles.isNotEmpty()) {
                             leftoverFiles = nonMediaFiles
                             showLeftoverDialog = true
@@ -284,12 +298,21 @@ fun SynologyDownloaderApp(repository: SynologyRepository) {
                     var filesDone = 0
                     
                     for ((index, file) in realFilesToDownload.withIndex()) {
-                        if (currentDownloadedBytes >= maxBytes) break
                         val remoteSize = file.additional?.size ?: 0L
+                        val sizeStr = when {
+                            remoteSize >= 1024 * 1024 -> String.format("%.2f MB", remoteSize / (1024.0 * 1024.0))
+                            remoteSize >= 1024 -> String.format("%.2f KB", remoteSize / 1024.0)
+                            else -> "$remoteSize B"
+                        }
+                        
+                        if (!isBackupRunning) break // Allow stopping current job
+                        appendLog(context, "Start processing: ${file.name} ($sizeStr)")
+                        if (currentDownloadedBytes >= maxBytes) break
                         
                         try {
                             withContext(Dispatchers.Main) {
-                                statusMessage = "Downloading (${index + 1}/${realFilesToDownload.size}): ${file.name}"
+                                statusMessage = "Downloading (${index + 1}/${realFilesToDownload.size}): ${file.name} ($sizeStr)"
+                                debugLog += "Start: ${file.name} ($sizeStr)\n"
                             }
                             
                             val stream = repository.downloadFile(file.path)
@@ -309,6 +332,7 @@ fun SynologyDownloaderApp(repository: SynologyRepository) {
                                     filesDone++
                                     withContext(Dispatchers.Main) {
                                         debugLog += "Downloaded: ${file.name}. Moving on NAS...\n"
+                                        appendLog(context, "Downloaded: ${file.name}. Moving on NAS...")
                                     }
                                     
                                     var destFolder = "/homes/$username/google_photo_backup"
@@ -326,8 +350,10 @@ fun SynologyDownloaderApp(repository: SynologyRepository) {
                                     withContext(Dispatchers.Main) {
                                         if (moveSuccess) {
                                             debugLog += " - Move to $destFolder: Success\n"
+                                            appendLog(context, " - Move to $destFolder: Success")
                                         } else {
                                             debugLog += " - Move: Failed\n"
+                                            appendLog(context, " - Move: Failed")
                                         }
                                     }
                                     
@@ -349,8 +375,10 @@ fun SynologyDownloaderApp(repository: SynologyRepository) {
                                             withContext(Dispatchers.Main) {
                                                 if (delResult == "Success") {
                                                     debugLog += " - Auto-Fix: Source deleted\n"
+                                                    appendLog(context, " - Auto-Fix: Source deleted")
                                                 } else {
                                                     debugLog += " - Auto-Fix Failed: $delResult\n"
+                                                    appendLog(context, " - Auto-Fix Failed: $delResult")
                                                 }
                                             }
                                         }
@@ -360,16 +388,19 @@ fun SynologyDownloaderApp(repository: SynologyRepository) {
                                 } else {
                                     withContext(Dispatchers.Main) {
                                         debugLog += "Failed to save: ${file.name}\n"
+                                        appendLog(context, "Failed to save: ${file.name}")
                                     }
                                 }
                             } else {
                                 withContext(Dispatchers.Main) {
                                     debugLog += "Failed to open stream for ${file.name}\n"
+                                    appendLog(context, "Failed to open stream for ${file.name}")
                                 }
                             }
                         } catch (e: Exception) {
                             withContext(Dispatchers.Main) {
                                 debugLog += "Error: ${file.name}: ${e.message}\n"
+                                appendLog(context, "Error: ${file.name}: ${e.message}")
                             }
                         }
                     }
@@ -378,6 +409,7 @@ fun SynologyDownloaderApp(repository: SynologyRepository) {
                     if (job is BackupJob.RecursiveBackup) {
                         withContext(Dispatchers.Main) {
                             debugLog += "Checking for empty directories...\n"
+                            appendLog(context, "Checking for empty directories...")
                         }
                         val dirsToCheck = mutableListOf<String>()
                         val dirQueue = ArrayDeque<String>()
@@ -401,6 +433,7 @@ fun SynologyDownloaderApp(repository: SynologyRepository) {
                                     deletedDirs++
                                     withContext(Dispatchers.Main) {
                                         debugLog += "Deleted empty dir: $dir\n"
+                                        appendLog(context, "Deleted empty dir: $dir")
                                     }
                                 }
                             }
@@ -408,6 +441,7 @@ fun SynologyDownloaderApp(repository: SynologyRepository) {
                         if (deletedDirs > 0) {
                             withContext(Dispatchers.Main) {
                                 debugLog += "Cleaned up $deletedDirs empty directories\n"
+                                appendLog(context, "Cleaned up $deletedDirs empty directories")
                             }
                         }
                     }
@@ -416,11 +450,13 @@ fun SynologyDownloaderApp(repository: SynologyRepository) {
                         val totalMB = currentDownloadedBytes / (1024 * 1024)
                         statusMessage = "Done: $filesDone files ($totalMB MB). Queue: ${backupQueue.size} remaining"
                         debugLog += "=== Job complete: ${job.label} ===\n"
+                        appendLog(context, "=== Job complete: ${job.label} ===")
                         refreshList(sourcePath)
                     }
                 }
             } catch (e: Exception) {
                 debugLog += "Queue job error: ${e.message}\n"
+                appendLog(context, "Queue job error: ${e.message}")
             } finally {
                 isBackupRunning = false
                 currentBackupLabel = ""
@@ -449,6 +485,7 @@ fun SynologyDownloaderApp(repository: SynologyRepository) {
                         isScanning = true
                         discoveredNas = emptyList()
                         statusMessage = "Scanning network..."
+                        appendLog(context, "Scanning network for NAS...")
                         withContext(Dispatchers.IO) {
                             try {
                                 // Get device IP
@@ -463,17 +500,21 @@ fun SynologyDownloaderApp(repository: SynologyRepository) {
                                 
                                 withContext(Dispatchers.Main) {
                                     statusMessage = "Scanning $subnet.1-254 on port 5001..."
+                                    appendLog(context, "Scanning $subnet.1-254 on port 5001...")
                                 }
                                 
                                 val found = repository.scanSubnet(subnet, 5001)
                                 withContext(Dispatchers.Main) {
                                     discoveredNas = found
                                     statusMessage = if (found.isEmpty()) "No NAS found" else "Found ${found.size} device(s)"
+                                    appendLog(context, if (found.isEmpty()) "No NAS found" else "Found ${found.size} device(s)")
                                     isScanning = false
                                 }
                             } catch (e: Exception) {
                                 withContext(Dispatchers.Main) {
                                     statusMessage = "Scan error: ${e.message}"
+                                    debugLog += "Scan error: ${e.message}\n"
+                                    appendLog(context, "Scan error: ${e.message}")
                                     isScanning = false
                                 }
                             }
@@ -585,6 +626,7 @@ fun SynologyDownloaderApp(repository: SynologyRepository) {
                     scope.launch {
                         statusMessage = "Logging in..."
                         debugLog += "Attempting login to $host with user $username...\n"
+                        appendLog(context, "Attempting login to $host with user $username...")
                         withContext(Dispatchers.IO) {
                             try {
                                 repository.init(host)
@@ -596,6 +638,7 @@ fun SynologyDownloaderApp(repository: SynologyRepository) {
                                 )
                                 withContext(Dispatchers.Main) {
                                     debugLog += "Result: ${result.message}\n"
+                                    appendLog(context, "Login Result: ${result.message}")
                                     if (result.message == "Success") {
                                         isLoggedIn = true
                                         statusMessage = "Logged in"
@@ -1106,7 +1149,7 @@ fun SynologyDownloaderApp(repository: SynologyRepository) {
             Text(text = statusMessage, modifier = Modifier.padding(top = 8.dp))
             
             // Debug Log Visibility Toggle
-            if (isLoggedIn) {
+            if (isLoggedIn || debugLog.isNotEmpty()) {
                 var showDebugLog by remember { mutableStateOf(false) }
                 
                 Button(onClick = { showDebugLog = !showDebugLog }, modifier = Modifier.fillMaxWidth().padding(vertical=4.dp)) {
@@ -1130,7 +1173,17 @@ fun SynologyDownloaderApp(repository: SynologyRepository) {
                     title = { Text("Non-Media Files Found") },
                     text = {
                         Column {
-                            Text("Found ${leftoverFiles.size} files that were skipped (not image/video).")
+                            val summary = remember(leftoverFiles) {
+                                leftoverFiles.groupingBy { 
+                                    val ext = it.name.substringAfterLast('.', "")
+                                    if(ext.isEmpty()) "No Ext" else ".${ext.lowercase()}"
+                                }.eachCount().entries.sortedByDescending { it.value }
+                                .joinToString(", ") { "${it.key}: ${it.value}" }
+                            }
+                            
+                            Text("Found ${leftoverFiles.size} skipped files.")
+                            Text("Types: $summary", style = MaterialTheme.typography.labelSmall, fontWeight = FontWeight.SemiBold, modifier = Modifier.padding(top = 4.dp))
+                            
                             Spacer(modifier = Modifier.height(8.dp))
                             Text("The list below shows files found in folders we backed up. You can choose to delete them from the NAS.")
                             Spacer(modifier = Modifier.height(8.dp))
@@ -1289,4 +1342,39 @@ suspend fun saveToMediaStore(context: Context, inputStream: InputStream, fileNam
             false
         }
     }
+}
+
+fun appendLog(context: Context, msg: String) {
+    try {
+        val file = File(context.filesDir, "last_session_log.txt")
+        // Rotate log if too big (500KB)
+        if (file.exists() && file.length() > 500 * 1024) {
+            file.delete()
+        }
+        java.io.FileOutputStream(file, true).use {
+            it.write(("${java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.getDefault()).format(java.util.Date())} : $msg\n").toByteArray())
+        }
+    } catch (e: Exception) {
+        e.printStackTrace()
+    }
+}
+
+fun readLastLog(context: Context): String {
+    return try {
+        val file = File(context.filesDir, "last_session_log.txt")
+        if (file.exists()) {
+            // Read last 5KB to avoid huge memory usage
+            val length = file.length()
+            val toRead = if (length > 5000) 5000 else length.toInt()
+            val bytes = ByteArray(toRead)
+            
+            java.io.RandomAccessFile(file, "r").use { raf ->
+                raf.seek(length - toRead)
+                raf.readFully(bytes)
+            }
+            String(bytes, Charsets.UTF_8)
+        } else ""
+    } catch (e: Exception) {
+        "Error reading log: ${e.message}\n"
+    } 
 }
