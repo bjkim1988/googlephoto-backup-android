@@ -8,6 +8,7 @@ import android.os.Bundle
 import android.os.Environment
 import android.provider.MediaStore
 import android.widget.Toast
+import androidx.core.app.NotificationCompat
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
@@ -210,6 +211,35 @@ fun SynologyDownloaderApp(repository: SynologyRepository) {
             activeBackupJob = scope.launch {
                 val powerManager = context.getSystemService(Context.POWER_SERVICE) as? android.os.PowerManager
                 val wakeLock = powerManager?.newWakeLock(android.os.PowerManager.PARTIAL_WAKE_LOCK, "SynologyDownloader::Backup")
+                
+                // Setup Notification
+                val notificationManager = context.getSystemService(Context.NOTIFICATION_SERVICE) as android.app.NotificationManager
+                val notificationId = 1
+                
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    val channel = android.app.NotificationChannel("backup_channel", "Backup Progress", android.app.NotificationManager.IMPORTANCE_LOW).apply {
+                        description = "Shows backup progress"
+                    }
+                    notificationManager.createNotificationChannel(channel)
+                }
+                
+                // Build intent to launch app on click
+                val intent = android.content.Intent(context, MainActivity::class.java).apply {
+                    flags = android.content.Intent.FLAG_ACTIVITY_SINGLE_TOP or android.content.Intent.FLAG_ACTIVITY_CLEAR_TOP
+                }
+                val pendingIntent = android.app.PendingIntent.getActivity(
+                    context, 0, intent,
+                    android.app.PendingIntent.FLAG_UPDATE_CURRENT or android.app.PendingIntent.FLAG_IMMUTABLE
+                )
+
+                val notificationBuilder = NotificationCompat.Builder(context, "backup_channel")
+                    .setSmallIcon(android.R.drawable.stat_sys_download)
+                    .setContentTitle("Synology Backup")
+                    .setContentIntent(pendingIntent)
+                    .setPriority(NotificationCompat.PRIORITY_LOW)
+                    .setOngoing(true)
+                    .setOnlyAlertOnce(true)
+                
                 if (wakeLock != null) {
                     wakeLock.acquire(10 * 60 * 60 * 1000L) // 10 hours max
                     appendLog(context, "WakeLock acquired")
@@ -327,6 +357,7 @@ fun SynologyDownloaderApp(repository: SynologyRepository) {
                     var currentDownloadedBytes = 0L
                     var filesDone = 0
                     val backupStartTime = System.currentTimeMillis()
+                    var lastNotifyTime = 0L
                     
                     for ((index, file) in realFilesToDownload.withIndex()) {
                         val remoteSize = file.additional?.size ?: 0L
@@ -357,6 +388,23 @@ fun SynologyDownloaderApp(repository: SynologyRepository) {
                                                  else if (remainingSeconds < 3600) " ETA: ${remainingSeconds/60}m ${remainingSeconds%60}s"
                                                  else " ETA: ${remainingSeconds/3600}h ${(remainingSeconds%3600)/60}m"
                                     }
+                                }
+
+                                // Update Notification (throttled to 1s)
+                                if (System.currentTimeMillis() - lastNotifyTime > 1000) {
+                                    val progress = ((index + 1) * 100) / realFilesToDownload.size
+                                    val cleanEta = etaStr.replace(" ETA:", "")
+                                    
+                                    notificationBuilder.setProgress(100, progress, false)
+                                        .setContentTitle("Backup $progress% (${index + 1}/${realFilesToDownload.size})")
+                                        .setContentText("${file.name} ($sizeStr)")
+                                        .setStyle(androidx.core.app.NotificationCompat.BigTextStyle()
+                                            .bigText("File: ${file.name}\nSize: $sizeStr\nTime Left: $cleanEta"))
+                                    
+                                    if (Build.VERSION.SDK_INT < 33 || androidx.core.content.ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) == android.content.pm.PackageManager.PERMISSION_GRANTED) {
+                                        notificationManager.notify(notificationId, notificationBuilder.build())
+                                    }
+                                    lastNotifyTime = System.currentTimeMillis()
                                 }
 
                                 val progressStr = if (totalMB > 921.6) { // 0.9 GB * 1024 MB/GB = 921.6 MB
@@ -511,6 +559,7 @@ fun SynologyDownloaderApp(repository: SynologyRepository) {
                 debugLog += "Queue job error: ${e.message}\n"
                 appendLog(context, "Queue job error: ${e.message}")
             } finally {
+                notificationManager.cancel(notificationId)
                 if (wakeLock?.isHeld == true) {
                     wakeLock.release()
                     appendLog(context, "WakeLock released")
