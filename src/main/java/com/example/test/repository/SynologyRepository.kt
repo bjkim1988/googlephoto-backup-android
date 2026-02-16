@@ -141,7 +141,11 @@ class SynologyRepository {
             if (sid == null) return emptyList()
             val response = api?.listFiles(folderPath = folderPath, additional = "[\"size\",\"time\"]", sid = sid!!)
             if (response?.isSuccessful == true && response.body()?.success == true) {
-                response.body()?.data?.files ?: emptyList()
+                response.body()?.data?.files?.filter { 
+                    it.name != "#recycle" && 
+                    !it.path.contains("/#recycle/") &&
+                    !it.name.endsWith("-poster.jpg", ignoreCase = true)
+                } ?: emptyList()
             } else {
                 emptyList()
             }

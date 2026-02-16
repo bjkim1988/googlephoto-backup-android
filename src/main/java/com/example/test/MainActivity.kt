@@ -393,13 +393,14 @@ fun SynologyDownloaderApp(repository: SynologyRepository) {
                                 // Update Notification (throttled to 1s)
                                 if (System.currentTimeMillis() - lastNotifyTime > 1000) {
                                     val progress = ((index + 1) * 100) / realFilesToDownload.size
-                                    val cleanEta = etaStr.replace(" ETA:", "")
+                                    val cleanEta = if (etaStr.isNotBlank()) etaStr.replace(" ETA:", "") else "Calculating..."
+                                    val etaDisplay = if (cleanEta == "Calculating...") cleanEta else "$cleanEta left"
                                     
                                     notificationBuilder.setProgress(100, progress, false)
-                                        .setContentTitle("Backup $progress% (${index + 1}/${realFilesToDownload.size})")
+                                        .setContentTitle("Backup: $progress% (${index + 1}/${realFilesToDownload.size}) - $etaDisplay")
                                         .setContentText("${file.name} ($sizeStr)")
                                         .setStyle(androidx.core.app.NotificationCompat.BigTextStyle()
-                                            .bigText("File: ${file.name}\nSize: $sizeStr\nTime Left: $cleanEta"))
+                                            .bigText("Path: ${file.path}\nSize: $sizeStr"))
                                     
                                     if (Build.VERSION.SDK_INT < 33 || androidx.core.content.ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) == android.content.pm.PackageManager.PERMISSION_GRANTED) {
                                         notificationManager.notify(notificationId, notificationBuilder.build())
