@@ -46,6 +46,9 @@ import java.io.File
 import java.io.FileOutputStream
 import java.io.InputStream
 
+import android.app.Activity
+import androidx.activity.compose.BackHandler
+
 class MainActivity : ComponentActivity() {
 
     private val repository = SynologyRepository()
@@ -148,6 +151,18 @@ fun SynologyDownloaderApp(repository: SynologyRepository) {
                     }
                 }
             }
+        }
+    }
+
+    // Handle back button
+    BackHandler(enabled = isLoggedIn) {
+        if (sourcePath == "/photo" || sourcePath == "/") {
+            (context as? Activity)?.finish()
+        } else {
+            val lastSlash = sourcePath.lastIndexOf('/')
+            val parentPath = if (lastSlash > 0) sourcePath.substring(0, lastSlash) else "/"
+            sourcePath = parentPath
+            refreshList(parentPath)
         }
     }
 
