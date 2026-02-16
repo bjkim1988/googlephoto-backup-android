@@ -326,6 +326,7 @@ fun SynologyDownloaderApp(repository: SynologyRepository) {
                     
                     var currentDownloadedBytes = 0L
                     var filesDone = 0
+                    val backupStartTime = System.currentTimeMillis()
                     
                     for ((index, file) in realFilesToDownload.withIndex()) {
                         val remoteSize = file.additional?.size ?: 0L
@@ -343,12 +344,27 @@ fun SynologyDownloaderApp(repository: SynologyRepository) {
                             withContext(Dispatchers.Main) {
                                 val currentMB = currentDownloadedBytes / (1024.0 * 1024.0)
                                 val totalMB = plannedDownloadBytes / (1024.0 * 1024.0)
+                                
+                                // ETA Calculation
+                                val elapsedTime = System.currentTimeMillis() - backupStartTime
+                                var etaStr = ""
+                                if (currentDownloadedBytes > 0 && elapsedTime > 2000) { // Wait 2s for stability
+                                    val bytesPerSec = (currentDownloadedBytes.toDouble() * 1000) / elapsedTime
+                                    val remainingBytes = plannedDownloadBytes - currentDownloadedBytes
+                                    if (bytesPerSec > 0) {
+                                        val remainingSeconds = (remainingBytes / bytesPerSec).toLong()
+                                        etaStr = if (remainingSeconds < 60) " ETA: ${remainingSeconds}s" 
+                                                 else if (remainingSeconds < 3600) " ETA: ${remainingSeconds/60}m ${remainingSeconds%60}s"
+                                                 else " ETA: ${remainingSeconds/3600}h ${(remainingSeconds%3600)/60}m"
+                                    }
+                                }
+
                                 val progressStr = if (totalMB > 921.6) { // 0.9 GB * 1024 MB/GB = 921.6 MB
                                     String.format("%.2f/%.2f GB", currentMB / 1024.0, totalMB / 1024.0)
                                 } else {
                                     String.format("%.1f/%.1f MB", currentMB, totalMB)
                                 }
-                                statusMessage = "Downloading ${index + 1}/${realFilesToDownload.size} ($progressStr): ${file.name} ($sizeStr)"
+                                statusMessage = "Downloading ${index + 1}/${realFilesToDownload.size} ($progressStr$etaStr): ${file.name} ($sizeStr)"
                                 debugLog += "Start: ${file.name} ($sizeStr)\n"
                             }
                             
@@ -1102,55 +1118,7 @@ fun SynologyDownloaderApp(repository: SynologyRepository) {
                 }
             }
 
-            Spacer(modifier = Modifier.height(8.dp))
-            Text(text = statusMessage, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.primary)
-            
-            // Debug Log UI with Auto-Scroll
-            if (isLoggedIn || debugLog.isNotEmpty()) {
-                var showDebugLog by remember { mutableStateOf(false) }
-                
-                Button(onClick = { showDebugLog = !showDebugLog }, modifier = Modifier.fillMaxWidth().padding(vertical=4.dp)) {
-                    Text(if (showDebugLog) "Hide Debug Log" else "Show Debug Log")
-                }
-                
-                if (showDebugLog) {
-                    val scrollState = rememberScrollState()
-                    LaunchedEffect(Unit) {
-                        delay(100) // Wait for initial layout
-                        scrollState.scrollTo(Int.MAX_VALUE)
-                    }
-                    LaunchedEffect(debugLog) {
-                        scrollState.scrollTo(Int.MAX_VALUE)
-                    }
-                    LaunchedEffect(scrollState.maxValue) {
-                        if (scrollState.maxValue > 0) {
-                             scrollState.scrollTo(scrollState.maxValue)
-                        }
-                    }
-                    
-                    Box(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .height(200.dp)
-                            .background(MaterialTheme.colorScheme.inverseOnSurface)
-                            .border(1.dp, MaterialTheme.colorScheme.outlineVariant)
-                            .verticalScroll(scrollState)
-                            .padding(8.dp)
-                    ) {
-                        SelectionContainer {
-                            Text(
-                                text = debugLog,
-                                style = MaterialTheme.typography.bodySmall.copy(
-                                    fontFamily = FontFamily.Monospace,
-                                    fontSize = 11.sp,
-                                    lineHeight = 14.sp
-                                ),
-                                color = MaterialTheme.colorScheme.onSurface
-                            )
-                        }
-                    }
-                }
-            }
+
             LazyColumn(modifier = Modifier.weight(1f)) {
                 if (sourcePath != "/" && sourcePath != "/photo" && sourcePath.isNotEmpty()) {
                     item {
@@ -1235,9 +1203,10 @@ fun SynologyDownloaderApp(repository: SynologyRepository) {
                 }
             }
             
-            Text(text = statusMessage, modifier = Modifier.padding(top = 8.dp))
+            Spacer(modifier = Modifier.height(8.dp))
+            Text(text = statusMessage, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.primary)
             
-            // Debug Log Visibility Toggle
+            // Debug Log UI with Auto-Scroll
             if (isLoggedIn || debugLog.isNotEmpty()) {
                 var showDebugLog by remember { mutableStateOf(false) }
                 
@@ -1246,13 +1215,41 @@ fun SynologyDownloaderApp(repository: SynologyRepository) {
                 }
                 
                 if (showDebugLog) {
-                    OutlinedTextField(
-                        value = debugLog,
-                        onValueChange = {},
-                        readOnly = true,
-                        modifier = Modifier.fillMaxWidth().height(150.dp).padding(vertical = 4.dp),
-                        textStyle = LocalTextStyle.current.copy(fontSize = TextUnit.Unspecified)
-                    )
+                    val scrollState = rememberScrollState()
+                    LaunchedEffect(Unit) {
+                        delay(100) // Wait for initial layout
+                        scrollState.scrollTo(Int.MAX_VALUE)
+                    }
+                    LaunchedEffect(debugLog) {
+                        scrollState.scrollTo(Int.MAX_VALUE)
+                    }
+                    LaunchedEffect(scrollState.maxValue) {
+                        if (scrollState.maxValue > 0) {
+                             scrollState.scrollTo(scrollState.maxValue)
+                        }
+                    }
+                    
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(200.dp)
+                            .background(MaterialTheme.colorScheme.inverseOnSurface)
+                            .border(1.dp, MaterialTheme.colorScheme.outlineVariant)
+                            .verticalScroll(scrollState)
+                            .padding(8.dp)
+                    ) {
+                        SelectionContainer {
+                            Text(
+                                text = debugLog,
+                                style = MaterialTheme.typography.bodySmall.copy(
+                                    fontFamily = FontFamily.Monospace,
+                                    fontSize = 11.sp,
+                                    lineHeight = 14.sp
+                                ),
+                                color = MaterialTheme.colorScheme.onSurface
+                            )
+                        }
+                    }
                 }
             }
             
