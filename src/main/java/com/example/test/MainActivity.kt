@@ -59,6 +59,13 @@ import androidx.compose.material3.TextButton
 import androidx.compose.foundation.layout.heightIn
 import java.io.FileOutputStream
 import java.io.InputStream
+import java.io.RandomAccessFile
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
+import android.media.ExifInterface
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 
 import android.app.Activity
 import androidx.activity.compose.BackHandler
@@ -427,7 +434,9 @@ fun SynologyDownloaderApp(repository: SynologyRepository) {
                                 } else {
                                     "nas"
                                 }
-                                val success = saveToMediaStore(context2, stream, file.name, localSubDir, remoteSize)
+                                val mtime = file.additional?.time?.mtime ?: 0L
+                                val lastModifiedMs = if (mtime > 0) mtime * 1000L else null
+                                val success = saveToMediaStore(context2, stream, file.name, localSubDir, remoteSize, lastModifiedMs)
                                 
                                 if (success) {
                                     currentDownloadedBytes += remoteSize
@@ -921,6 +930,52 @@ fun SynologyDownloaderApp(repository: SynologyRepository) {
             }
 
         } else {
+            // Storage Usage Display
+            var storageStats by remember { mutableStateOf<Pair<Long, Long>?>(null) }
+            var refreshStorageTrigger by remember { mutableStateOf(0) }
+            
+            LaunchedEffect(refreshStorageTrigger) {
+                withContext(Dispatchers.IO) {
+                    val dir = Environment.getExternalStorageDirectory()
+                    storageStats = Pair(dir.totalSpace, dir.freeSpace)
+                }
+            }
+            
+            storageStats?.let { (total, free) ->
+                val used = total - free
+                val usedGB = used / (1024.0 * 1024.0 * 1024.0)
+                val totalGB = total / (1024.0 * 1024.0 * 1024.0)
+                val percent = if (total > 0) (used.toDouble() / total.toDouble()) else 0.0
+                
+                Card(
+                    modifier = Modifier.fillMaxWidth().padding(bottom = 16.dp),
+                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)
+                ) {
+                    Column(modifier = Modifier.padding(12.dp)) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text("Device Storage", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            Text(
+                                text = String.format("%.2f GB / %.2f GB", usedGB, totalGB),
+                                style = MaterialTheme.typography.labelSmall,
+                                fontWeight = FontWeight.Bold,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                        Spacer(modifier = Modifier.height(4.dp))
+                        LinearProgressIndicator(
+                            progress = percent.toFloat(),
+                            modifier = Modifier.fillMaxWidth().height(6.dp),
+                            color = if (percent > 0.9) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary,
+                            trackColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f)
+                        )
+                    }
+                }
+            }
+            
             OutlinedTextField(
                 value = TextFieldValue(sourcePath, TextRange(sourcePath.length)),
                 onValueChange = { sourcePath = it.text },
@@ -1019,9 +1074,20 @@ fun SynologyDownloaderApp(repository: SynologyRepository) {
 
                                         val stream = repository.downloadFile(file.path)
                                         if (stream != null) {
-                                            val success = saveToMediaStore(context, stream, file.name, "nas", remoteSize)
+                                            val mtime = file.additional?.time?.mtime ?: 0L
+                                            val lastModifiedMs = if (mtime > 0) mtime * 1000L else null
+                                            val success = saveToMediaStore(context, stream, file.name, "nas", remoteSize, lastModifiedMs)
                                             if (success) {
                                                 totalBytes += remoteSize
+                                                // Check if we crossed another 100MB threshold
+                                                if (totalBytes >= 100 * 1024 * 1024) {
+                                                     totalBytes = 0 // Reset counter or accumulate? User said "every 100MB". 
+                                                     // Let's reset purely for trigger efficiency or keep it running? 
+                                                     // Simpler: Just trigger update.
+                                                     refreshStorageTrigger++
+                                                     totalBytes = 0
+                                                }
+                                                
                                                 count++
                                                 withContext(Dispatchers.Main) {
                                                     debugLog += " - Download Success\n"
@@ -1077,47 +1143,9 @@ fun SynologyDownloaderApp(repository: SynologyRepository) {
                     }
                 }
             } else {
-                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                Button(onClick = {
-                    val newJob = BackupJob.RecursiveBackup(sourcePath)
-                    
-                    if (isBackupRunning && currentBackupLabel == newJob.label) {
-                        Toast.makeText(context, "Task is currently running!", Toast.LENGTH_SHORT).show()
-                    } else if (backupQueue.any { it.label == newJob.label }) {
-                         Toast.makeText(context, "Task is already in queue!", Toast.LENGTH_SHORT).show()
-                    } else {
-                        backupQueue = backupQueue + newJob
-                        statusMessage = "Queued: Full Backup of $sourcePath (Queue: ${backupQueue.size})"
-                    }
-                }) {
-                    Text("Start Backup")
-                }
 
 
 
-                    Button(onClick = {
-                        scope.launch {
-                            statusMessage = "Downloading all..."
-                            var count = 0
-                            withContext(Dispatchers.IO) {
-                                 val filesToDownload = fileList.filter { !it.isdir }
-                                 filesToDownload.forEach { file ->
-                                    val stream = repository.downloadFile(file.path)
-                                    if (stream != null) {
-                                        saveToMediaStore(context, stream, file.name, "SynologyDownloader", 0)
-                                        count++
-                                        withContext(Dispatchers.Main) {
-                                                statusMessage = "Downloaded $count files..."
-                                        }
-                                    }
-                                }
-                            }
-                            statusMessage = "Download completed ($count files)"
-                        }
-                    }) {
-                        Text("Download All")
-                    }
-                }
 
                 // Compact Queue Status UI (Expandable)
                 if (isBackupRunning || backupQueue.isNotEmpty()) {
@@ -1153,6 +1181,7 @@ fun SynologyDownloaderApp(repository: SynologyRepository) {
                                             activeBackupJob?.cancel()
                                             backupQueue = emptyList()
                                             statusMessage = "Cancelled"
+                                            refreshStorageTrigger++ // Update storage on stop
                                         },
                                         colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error),
                                         contentPadding = PaddingValues(horizontal = 12.dp, vertical = 0.dp),
@@ -1183,7 +1212,10 @@ fun SynologyDownloaderApp(repository: SynologyRepository) {
                                     
                                     if (!isQueueExpanded) {
                                          Button(
-                                            onClick = { backupQueue = emptyList() },
+                                            onClick = { 
+                                                backupQueue = emptyList() 
+                                                refreshStorageTrigger++
+                                            },
                                             colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error),
                                             contentPadding = PaddingValues(horizontal = 12.dp, vertical = 0.dp),
                                             modifier = Modifier.height(32.dp)
@@ -1210,7 +1242,10 @@ fun SynologyDownloaderApp(repository: SynologyRepository) {
                                 
                                 Spacer(modifier = Modifier.height(8.dp))
                                 Button(
-                                    onClick = { backupQueue = emptyList() },
+                                    onClick = { 
+                                        backupQueue = emptyList() 
+                                        refreshStorageTrigger++
+                                    },
                                     modifier = Modifier.fillMaxWidth(),
                                     colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error)
                                 ) {
@@ -1312,13 +1347,72 @@ fun SynologyDownloaderApp(repository: SynologyRepository) {
             
             // Debug Log UI with Auto-Scroll
             if (isLoggedIn || debugLog.isNotEmpty()) {
-                var showDebugLog by remember { mutableStateOf(false) }
                 
-                Button(onClick = { showDebugLog = !showDebugLog }, modifier = Modifier.fillMaxWidth().padding(vertical=4.dp)) {
-                    Text(if (showDebugLog) "Hide Debug Log" else "Show Debug Log")
-                }
-                
-                if (showDebugLog) {
+
+                // Action Buttons Row (Backup, Download, Debug Log)
+                if (!isSelectionMode) {
+                     var showDebugLog by remember { mutableStateOf(false) }
+                     
+                    Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Button(
+                            modifier = Modifier.weight(1f),
+                            contentPadding = PaddingValues(horizontal = 4.dp),
+                            onClick = {
+                                val newJob = BackupJob.RecursiveBackup(sourcePath)
+                                if (isBackupRunning && currentBackupLabel == newJob.label) {
+                                    Toast.makeText(context, "Task is currently running!", Toast.LENGTH_SHORT).show()
+                                } else if (backupQueue.any { it.label == newJob.label }) {
+                                     Toast.makeText(context, "Task is already in queue!", Toast.LENGTH_SHORT).show()
+                                } else {
+                                    backupQueue = backupQueue + newJob
+                                    statusMessage = "Queued: Full Backup of $sourcePath"
+                                }
+                            }
+                        ) {
+                            Text("Backup", fontSize = 12.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                        }
+
+                        Button(
+                            modifier = Modifier.weight(1f),
+                            contentPadding = PaddingValues(horizontal = 4.dp),
+                            onClick = { showDebugLog = !showDebugLog },
+                            colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.tertiary)
+                        ) {
+                            Text(if (showDebugLog) "Hide Log" else "Show Log", fontSize = 12.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                        }
+    
+                        Button(
+                            modifier = Modifier.weight(1f),
+                            contentPadding = PaddingValues(horizontal = 4.dp),
+                            onClick = {
+                                scope.launch {
+                                    statusMessage = "Downloading all..."
+                                    var count = 0
+                                    withContext(Dispatchers.IO) {
+                                         val filesToDownload = fileList.filter { !it.isdir }
+                                         filesToDownload.forEach { file ->
+                                            val stream = repository.downloadFile(file.path)
+                                            if (stream != null) {
+                                                val mtime = file.additional?.time?.mtime ?: 0L
+                                                val lastModifiedMs = if (mtime > 0) mtime * 1000L else null
+                                                saveToMediaStore(context, stream, file.name, "SynologyDownloader", 0, lastModifiedMs)
+                                                count++
+                                                withContext(Dispatchers.Main) {
+                                                        statusMessage = "Downloaded $count files..."
+                                                }
+                                            }
+                                        }
+                                    }
+                                    statusMessage = "Download completed ($count files)"
+                                }
+                            }
+                        ) {
+                            Text("Download", fontSize = 12.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                        }
+                    }
+                    Spacer(modifier = Modifier.height(8.dp))
+                    
+                    if (showDebugLog) {
                     val scrollState = rememberScrollState()
                     
                     // Initial scroll to bottom
@@ -1361,6 +1455,7 @@ fun SynologyDownloaderApp(repository: SynologyRepository) {
                     }
                 }
             }
+        }
             
             if (showStorageErrorDialog) {
                 AlertDialog(
@@ -1495,21 +1590,34 @@ fun findFileInMediaStore(context: Context, fileName: String, subDir: String): Lo
     return null
 }
 
-suspend fun saveToMediaStore(context: Context, inputStream: InputStream, fileName: String, subDir: String, expectedSize: Long): Boolean {
+suspend fun saveToMediaStore(context: Context, inputStream: InputStream, fileName: String, subDir: String, expectedSize: Long, lastModified: Long? = null): Boolean {
+    val ext = fileName.substringAfterLast('.', "").lowercase(Locale.ROOT)
+    val isImage = ext in setOf("jpg", "jpeg", "png", "webp", "heic")
+    val isMp4Video = ext in setOf("mp4", "mov")
+    val mimeType = when (ext) {
+        "jpg", "jpeg" -> "image/jpeg"
+        "png" -> "image/png"
+        "webp" -> "image/webp"
+        "heic" -> "image/heic"
+        "mp4" -> "video/mp4"
+        "avi" -> "video/x-msvideo"
+        "mov" -> "video/quicktime"
+        "mkv" -> "video/x-matroska"
+        else -> "application/octet-stream"
+    }
+
     return withContext(Dispatchers.IO) {
         try {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                // Check if file exists to handle duplicates/renaming logic if needed?
-                // For 'save', MediaStore usually auto-renames duplicates (e.g. file(1).jpg).
-                // But for our Backup 'sync' logic, we want to know if we should skip.
-                // The caller should have called findFileInMediaStore first.
-                // Here we just write.
-
                 val values = ContentValues().apply {
                     put(MediaStore.MediaColumns.DISPLAY_NAME, fileName)
-                    put(MediaStore.MediaColumns.MIME_TYPE, "application/octet-stream") // Or detect mime type
+                    put(MediaStore.MediaColumns.MIME_TYPE, mimeType)
                     put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS + "/$subDir")
                     put(MediaStore.MediaColumns.IS_PENDING, 1)
+                    if (lastModified != null && lastModified > 0) {
+                        put(MediaStore.MediaColumns.DATE_MODIFIED, lastModified / 1000)
+                        put(MediaStore.MediaColumns.DATE_ADDED, lastModified / 1000)
+                    }
                 }
                 
                 val resolver = context.contentResolver
@@ -1519,6 +1627,50 @@ suspend fun saveToMediaStore(context: Context, inputStream: InputStream, fileNam
                     resolver.openOutputStream(it)?.use { outputStream ->
                         inputStream.copyTo(outputStream)
                     }
+
+                    // Inject EXIF DateTimeOriginal if missing (images only)
+                    if (lastModified != null && lastModified > 0 && isImage) {
+                        try {
+                            resolver.openFileDescriptor(it, "rw")?.use { pfd ->
+                                val exif = ExifInterface(pfd.fileDescriptor)
+                                val existing = exif.getAttribute(ExifInterface.TAG_DATETIME_ORIGINAL)
+                                if (existing.isNullOrEmpty()) {
+                                    val sdf = SimpleDateFormat("yyyy:MM:dd HH:mm:ss", Locale.US)
+                                    exif.setAttribute(ExifInterface.TAG_DATETIME_ORIGINAL, sdf.format(Date(lastModified)))
+                                    exif.setAttribute(ExifInterface.TAG_DATETIME, sdf.format(Date(lastModified)))
+                                    exif.saveAttributes()
+                                }
+                            }
+                        } catch (e: Exception) {
+                            e.printStackTrace()
+                        }
+                    }
+
+                    // Inject MP4 creation_time if missing (mp4/mov videos)
+                    if (lastModified != null && lastModified > 0 && isMp4Video) {
+                        try {
+                            resolver.openFileDescriptor(it, "rw")?.use { pfd ->
+                                val fd = pfd.fileDescriptor
+                                val fis = java.io.FileInputStream(fd)
+                                val channel = fis.channel
+                                val tempFile = File(context.cacheDir, "temp_mp4_meta_${System.currentTimeMillis()}")
+                                tempFile.outputStream().use { os -> fis.copyTo(os) }
+                                channel.close()
+                                fis.close()
+                                
+                                injectMp4CreationDate(tempFile, lastModified)
+                                
+                                // Write back
+                                resolver.openOutputStream(it, "wt")?.use { os ->
+                                    tempFile.inputStream().use { input -> input.copyTo(os) }
+                                }
+                                tempFile.delete()
+                            }
+                        } catch (e: Exception) {
+                            e.printStackTrace()
+                        }
+                    }
+
                     values.clear()
                     values.put(MediaStore.MediaColumns.IS_PENDING, 0)
                     resolver.update(it, values, null, null)
@@ -1529,27 +1681,163 @@ suspend fun saveToMediaStore(context: Context, inputStream: InputStream, fileNam
                 if (!targetDir.exists()) targetDir.mkdirs()
                 val targetFile = File(targetDir, fileName)
                 
-                // Legacy simple rename logic
                 var finalFile = targetFile
                 var v = 1
                 val name = fileName.substringBeforeLast('.')
-                val ext = fileName.substringAfterLast('.', "")
-                val dot = if (ext.isNotEmpty()) "." else ""
+                val extPart = fileName.substringAfterLast('.', "")
+                val dot = if (extPart.isNotEmpty()) "." else ""
                 
                 while (finalFile.exists()) {
-                   finalFile = File(targetDir, "${name}_$v$dot$ext")
+                   finalFile = File(targetDir, "${name}_$v$dot$extPart")
                    v++
                 }
                 
                 FileOutputStream(finalFile).use { outputStream ->
                     inputStream.copyTo(outputStream)
                 }
+
+                // Set file modified time
+                if (lastModified != null && lastModified > 0) {
+                    finalFile.setLastModified(lastModified)
+                }
+
+                // Inject EXIF DateTimeOriginal if missing (images only)
+                if (lastModified != null && lastModified > 0 && isImage) {
+                    try {
+                        val exif = ExifInterface(finalFile.absolutePath)
+                        val existing = exif.getAttribute(ExifInterface.TAG_DATETIME_ORIGINAL)
+                        if (existing.isNullOrEmpty()) {
+                            val sdf = SimpleDateFormat("yyyy:MM:dd HH:mm:ss", Locale.US)
+                            exif.setAttribute(ExifInterface.TAG_DATETIME_ORIGINAL, sdf.format(Date(lastModified)))
+                            exif.setAttribute(ExifInterface.TAG_DATETIME, sdf.format(Date(lastModified)))
+                            exif.saveAttributes()
+                        }
+                    } catch (e: Exception) {
+                        e.printStackTrace()
+                    }
+                }
+
+                // Inject MP4 creation_time if missing (mp4/mov videos)
+                if (lastModified != null && lastModified > 0 && isMp4Video) {
+                    try {
+                        injectMp4CreationDate(finalFile, lastModified)
+                    } catch (e: Exception) {
+                        e.printStackTrace()
+                    }
+                }
+
                 true
             }
         } catch (e: Exception) {
             e.printStackTrace()
             false
         }
+    }
+}
+
+/**
+ * Inject creation_time into MP4/MOV file's mvhd atom.
+ * MP4 epoch starts 1904-01-01 (offset = 2082844800 seconds from Unix epoch).
+ * Only writes if the existing creation_time is 0.
+ */
+fun injectMp4CreationDate(file: File, lastModifiedMs: Long) {
+    val MP4_EPOCH_OFFSET = 2082844800L
+    val mp4Time = (lastModifiedMs / 1000) + MP4_EPOCH_OFFSET
+
+    val raf = RandomAccessFile(file, "rw")
+    try {
+        val fileSize = raf.length()
+        var pos = 0L
+
+        // Find moov atom at top level
+        var moovPos = -1L
+        var moovSize = 0L
+        while (pos < fileSize) {
+            raf.seek(pos)
+            if (pos + 8 > fileSize) break
+            val size = raf.readInt().toLong() and 0xFFFFFFFFL
+            val typeBytes = ByteArray(4)
+            raf.readFully(typeBytes)
+            val type = String(typeBytes, Charsets.US_ASCII)
+
+            if (size < 8 && size != 1L) break // invalid
+            val atomSize = if (size == 1L) {
+                if (pos + 16 > fileSize) break
+                raf.readLong() // 64-bit extended size
+            } else {
+                size
+            }
+            if (atomSize <= 0) break
+
+            if (type == "moov") {
+                moovPos = pos
+                moovSize = atomSize
+                break
+            }
+            pos += atomSize
+        }
+
+        if (moovPos < 0) {
+            raf.close()
+            return
+        }
+
+        // Find mvhd atom inside moov
+        val headerSize = 8L // moov header size
+        var innerPos = moovPos + headerSize
+        val moovEnd = moovPos + moovSize
+
+        while (innerPos < moovEnd) {
+            raf.seek(innerPos)
+            if (innerPos + 8 > moovEnd) break
+            val size = raf.readInt().toLong() and 0xFFFFFFFFL
+            val typeBytes = ByteArray(4)
+            raf.readFully(typeBytes)
+            val type = String(typeBytes, Charsets.US_ASCII)
+
+            if (size < 8 && size != 1L) break
+            val atomSize = if (size == 1L) {
+                if (innerPos + 16 > moovEnd) break
+                raf.readLong()
+            } else {
+                size
+            }
+            if (atomSize <= 0) break
+
+            if (type == "mvhd") {
+                // mvhd found: [size(4)][type(4)][version(1)][flags(3)][creation_time][modification_time]...
+                val dataStart = innerPos + 8
+                raf.seek(dataStart)
+                val version = raf.readByte().toInt() and 0xFF
+                raf.skipBytes(3) // flags
+
+                if (version == 0) {
+                    // 4-byte timestamps
+                    val creationTimePos = dataStart + 4
+                    raf.seek(creationTimePos)
+                    val existingCreation = raf.readInt().toLong() and 0xFFFFFFFFL
+                    if (existingCreation == 0L) {
+                        raf.seek(creationTimePos)
+                        raf.writeInt(mp4Time.toInt()) // creation_time
+                        raf.writeInt(mp4Time.toInt()) // modification_time
+                    }
+                } else if (version == 1) {
+                    // 8-byte timestamps
+                    val creationTimePos = dataStart + 4
+                    raf.seek(creationTimePos)
+                    val existingCreation = raf.readLong()
+                    if (existingCreation == 0L) {
+                        raf.seek(creationTimePos)
+                        raf.writeLong(mp4Time) // creation_time
+                        raf.writeLong(mp4Time) // modification_time
+                    }
+                }
+                break
+            }
+            innerPos += atomSize
+        }
+    } finally {
+        raf.close()
     }
 }
 
