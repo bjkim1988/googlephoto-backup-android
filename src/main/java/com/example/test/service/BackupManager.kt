@@ -9,6 +9,9 @@ object BackupManager {
     private val _queue = MutableStateFlow<List<BackupJob>>(emptyList())
     val queue = _queue.asStateFlow()
 
+    private val _activeJob = MutableStateFlow<BackupJob?>(null)
+    val activeJob = _activeJob.asStateFlow()
+
     private val _isBackupRunning = MutableStateFlow(false)
     val isBackupRunning = _isBackupRunning.asStateFlow()
 
@@ -36,6 +39,7 @@ object BackupManager {
         if (current.isNotEmpty()) {
             val job = current.removeAt(0)
             _queue.value = current
+            _activeJob.value = job
             return job
         }
         return null
@@ -47,6 +51,7 @@ object BackupManager {
 
     fun setRunning(running: Boolean) {
         _isBackupRunning.value = running
+        if (!running) _activeJob.value = null
     }
     
     fun appendLog(msg: String) {

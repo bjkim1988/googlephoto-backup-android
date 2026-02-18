@@ -165,7 +165,8 @@ fun SynologyDownloaderApp(repository: SynologyRepository) {
     // Let's use BackupManager.debugLog as the source of truth if possible, or just append local logs to it.
     val debugLog by com.example.test.service.BackupManager.debugLog.collectAsState()
     
-    var currentBackupLabel by remember { mutableStateOf("") } // Start/Stop logic needs this? 
+    val activeJob by com.example.test.service.BackupManager.activeJob.collectAsState()
+    val currentBackupLabel = activeJob?.label ?: "" 
     // Actually BackupManager doesn't expose current label directly except via status?
     // We can filter queue to guess.
     // Or add currentJobLabel to BackupManager.
