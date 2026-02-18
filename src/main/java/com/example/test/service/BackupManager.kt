@@ -16,6 +16,7 @@ object BackupManager {
     val debugLog = MutableStateFlow("")
     val progress = MutableStateFlow(0)
     val currentFile = MutableStateFlow("")
+    val storageStats = MutableStateFlow<Pair<Long, Long>?>(null)
     
     // Config
     var username: String = ""

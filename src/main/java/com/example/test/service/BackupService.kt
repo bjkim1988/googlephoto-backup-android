@@ -178,6 +178,7 @@ class BackupService : Service() {
              var filesDone = 0
              val backupStartTime = System.currentTimeMillis()
              var lastNotifyTime = 0L
+             var lastStorageReportBytes = 0L
              val notificationManager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
 
              for ((index, file) in realFilesToDownload.withIndex()) {
@@ -262,6 +263,8 @@ class BackupService : Service() {
                             val mtime = file.additional?.time?.mtime ?: 0L
                             val lastModifiedMs = if (mtime > 0) mtime * 1000L else null
                             
+                            BackupManager.statusMessage.value = "Saving ${index+1}/${realFilesToDownload.size} ($progressStr$etaStr): ${file.name}"
+                            
                             success = saveToMediaStore(context, stream, file.name, localSubDir, remoteSize, lastModifiedMs) { msg ->
                                 CoroutineScope(Dispatchers.Main).launch {
                                     BackupManager.appendLog(msg)
@@ -280,6 +283,12 @@ class BackupService : Service() {
                         
                         if (success) {
                             currentDownloadedBytes += remoteSize
+                            
+                            if (currentDownloadedBytes - lastStorageReportBytes > 100 * 1024 * 1024) {
+                                val dir = Environment.getExternalStorageDirectory()
+                                BackupManager.storageStats.value = Pair(dir.totalSpace, dir.freeSpace)
+                                lastStorageReportBytes = currentDownloadedBytes
+                            }
                         filesDone++
                         
                         if (job.moveOnNas) {

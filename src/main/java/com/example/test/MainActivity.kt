@@ -603,15 +603,20 @@ fun SynologyDownloaderApp(repository: SynologyRepository) {
 
         } else {
             // Storage Usage Display
-            var storageStats by remember { mutableStateOf<Pair<Long, Long>?>(null) }
-            var refreshStorageTrigger by remember { mutableStateOf(0) }
+            val serviceStorageStats by BackupManager.storageStats.collectAsState()
+            var localStorageStats by remember { mutableStateOf<Pair<Long, Long>?>(null) }
             
-            LaunchedEffect(refreshStorageTrigger) {
+            LaunchedEffect(Unit) {
                 withContext(Dispatchers.IO) {
                     val dir = Environment.getExternalStorageDirectory()
-                    storageStats = Pair(dir.totalSpace, dir.freeSpace)
+                    localStorageStats = Pair(dir.totalSpace, dir.freeSpace)
+                    if (BackupManager.storageStats.value == null) {
+                        BackupManager.storageStats.value = localStorageStats
+                    }
                 }
             }
+            
+            val storageStats = serviceStorageStats ?: localStorageStats
             
             storageStats?.let { (total, free) ->
                 val used = total - free
@@ -796,7 +801,6 @@ fun SynologyDownloaderApp(repository: SynologyRepository) {
                                             context.stopService(intent)
                                             BackupManager.clearQueue()
                                             localStatusMessage = "Cancelled"
-                                            refreshStorageTrigger++ // Update storage on stop
                                         },
                                         colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error),
                                         contentPadding = PaddingValues(horizontal = 12.dp, vertical = 0.dp),
@@ -829,7 +833,6 @@ fun SynologyDownloaderApp(repository: SynologyRepository) {
                                          Button(
                                             onClick = { 
                                                 BackupManager.clearQueue()
-                                                refreshStorageTrigger++
                                             },
                                             colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error),
                                             contentPadding = PaddingValues(horizontal = 12.dp, vertical = 0.dp),
@@ -859,7 +862,6 @@ fun SynologyDownloaderApp(repository: SynologyRepository) {
                                 Button(
                                     onClick = { 
                                         BackupManager.clearQueue()
-                                        refreshStorageTrigger++
                                     },
                                     modifier = Modifier.fillMaxWidth(),
                                     colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error)

@@ -68,51 +68,115 @@ suspend fun saveToMediaStore(context: Context, inputStream: InputStream, fileNam
         val canUseFileApi = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
             Environment.isExternalStorageManager()
         } else {
-            Build.VERSION.SDK_INT < Build.VERSION_CODES.Q
+            true // Legacy storage allows File API on Android 10 and below
         }
 
             if (!canUseFileApi) {
                 // Use MediaStore (Scopred Storage)
                 onLog("Saving via MediaStore API...")
                 val resolver = context.contentResolver
-                var uri: android.net.Uri? = null
-                var currentFileName = fileName
-                var retryCount = 0
-                
-                while (uri == null && retryCount < 3) {
-                    val values = ContentValues().apply {
-                        put(MediaStore.MediaColumns.DISPLAY_NAME, currentFileName)
-                        put(MediaStore.MediaColumns.MIME_TYPE, mimeType)
-                        put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS + "/$subDir/")
-                        put(MediaStore.MediaColumns.IS_PENDING, 1)
-                        if (lastModified != null && lastModified > 0) {
-                            put(MediaStore.MediaColumns.DATE_MODIFIED, lastModified / 1000)
-                            put(MediaStore.MediaColumns.DATE_ADDED, lastModified / 1000)
-                            put(MediaStore.MediaColumns.DATE_TAKEN, lastModified)
-                        }
+                val values = ContentValues().apply {
+                    put(MediaStore.MediaColumns.DISPLAY_NAME, fileName)
+                    put(MediaStore.MediaColumns.MIME_TYPE, mimeType)
+                    put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS + "/$subDir/")
+                    put(MediaStore.MediaColumns.IS_PENDING, 1)
+                    if (lastModified != null && lastModified > 0) {
+                        put(MediaStore.MediaColumns.DATE_MODIFIED, lastModified / 1000)
+                        put(MediaStore.MediaColumns.DATE_ADDED, lastModified / 1000)
+                        put(MediaStore.MediaColumns.DATE_TAKEN, lastModified)
                     }
-                    
+                }
+
+                var uri: android.net.Uri? = null
+                try {
+                    uri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
+                } catch (e: Exception) {
+                    onLog("Insert Exception: ${e.message}")
+                }
+
+                if (uri == null) {
+                    onLog("Insert failed (Conflict?). Attempting to find and delete existing file...")
+                    try {
+                        // Relaxed query: match name only, check path manually
+                        val selection = "${MediaStore.MediaColumns.DISPLAY_NAME} = ?"
+                        val selectionArgs = arrayOf(fileName)
+                        
+                        var deletedCount = 0
+                        context.contentResolver.query(
+                            MediaStore.Downloads.EXTERNAL_CONTENT_URI,
+                            arrayOf(MediaStore.MediaColumns._ID, MediaStore.MediaColumns.RELATIVE_PATH),
+                            selection, 
+                            selectionArgs, 
+                            null
+                        )?.use { cursor ->
+                            val idIndex = cursor.getColumnIndex(MediaStore.MediaColumns._ID)
+                            val pathIndex = cursor.getColumnIndex(MediaStore.MediaColumns.RELATIVE_PATH)
+                            
+                            while (cursor.moveToNext()) {
+                                if (idIndex >= 0) {
+                                    val id = cursor.getLong(idIndex)
+                                    val path = if (pathIndex >= 0) cursor.getString(pathIndex) else ""
+                                    
+                                    // Delete if path matches strict or loose (contains subDir) to be safe
+                                    if (path != null && (path.contains(subDir) || subDir.isEmpty())) {
+                                        try {
+                                            val deleteUri = android.content.ContentUris.withAppendedId(MediaStore.Downloads.EXTERNAL_CONTENT_URI, id)
+                                            resolver.delete(deleteUri, null, null)
+                                            deletedCount++
+                                            onLog("Deleted conflicting file ID: $id (Path: $path)")
+                                        } catch (e: Exception) {
+                                             onLog("Failed to delete ID $id: ${e.message}")
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        
+                        if (deletedCount > 0) {
+                             onLog("Deleted $deletedCount files. Retrying insert...")
+                             uri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
+                        } else {
+                             onLog("No conflicting MediaStore files. Attempting physical delete...")
+                             try {
+                                 val targetDir = File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS), subDir)
+                                 val targetFile = File(targetDir, fileName)
+                                 if (targetFile.exists()) {
+                                     if (targetFile.delete()) {
+                                         onLog("Physical file deleted. Retrying insert...")
+                                         uri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
+                                     } else {
+                                         onLog("Physical delete failed. Check permissions.")
+                                     }
+                                 } else {
+                                     onLog("Physical file not found.")
+                                 }
+                             } catch (e: Exception) {
+                                 onLog("Physical delete error: ${e.message}")
+                             }
+                        }
+                        
+                    } catch (e: Exception) {
+                        onLog("Overwrite failed: ${e.message}")
+                    }
+                }
+
+                // Fallback: Try without IS_PENDING
+                if (uri == null) {
+                    onLog("Retry insert WITHOUT IS_PENDING flag...")
+                    values.remove(MediaStore.MediaColumns.IS_PENDING)
                     try {
                         uri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
                     } catch (e: Exception) {
-                        onLog("Insert Exception: ${e.message}")
-                    }
-                    
-                    if (uri == null) {
-                        onLog("MediaStore insert failed for $currentFileName. Retrying with new name...")
-                        val nameNoExt = fileName.substringBeforeLast('.')
-                        val extPart = fileName.substringAfterLast('.', "")
-                        val dot = if (extPart.isNotEmpty()) "." else ""
-                        currentFileName = "${nameNoExt}_${System.currentTimeMillis()}$dot$extPart"
-                        retryCount++
+                         onLog("Final fallback failed: ${e.message}")
                     }
                 }
-                
+
                 if (uri == null) {
-                    onLog("Error: MediaStore insert failed permanently (uri is null). Check permissions.")
+                    onLog("Error: MediaStore insert failed permanently. Check permissions.")
                     return@withContext false
                 }
                 
+                val currentFileName = fileName 
                 val finalUri = uri!!
                 finalUri.let {
                     resolver.openOutputStream(it)?.use { outputStream ->
