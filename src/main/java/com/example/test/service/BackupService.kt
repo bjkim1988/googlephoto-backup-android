@@ -36,7 +36,11 @@ class BackupService : Service() {
         wakeLock = powerManager.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "SynologyDownloader::BackupService")
         
         val wifiManager = applicationContext.getSystemService(Context.WIFI_SERVICE) as android.net.wifi.WifiManager
-        wifiLock = wifiManager.createWifiLock(android.net.wifi.WifiManager.WIFI_MODE_FULL_HIGH_PERF, "SynologyDownloader::BackupWifiLock")
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            wifiLock = wifiManager.createWifiLock(android.net.wifi.WifiManager.WIFI_MODE_FULL_LOW_LATENCY, "SynologyDownloader::BackupWifiLock")
+        } else {
+            wifiLock = wifiManager.createWifiLock(android.net.wifi.WifiManager.WIFI_MODE_FULL_HIGH_PERF, "SynologyDownloader::BackupWifiLock")
+        }
         wifiLock?.setReferenceCounted(false)
     }
 
@@ -134,10 +138,20 @@ class BackupService : Service() {
                 val remoteSize = file.additional?.size ?: 0L
                 
                 // Local check logic mirroring MainActivity
+                // Local check logic mirroring MainActivity
                 val parentPath = file.path.substringBeforeLast('/')
-                val localSubDir = if (parentPath.length > job.sourcePath.length) {
-                    "nas" + parentPath.substring(job.sourcePath.length)
+                val localSubDir = if (file.path.startsWith("/photo")) {
+                    val sub = parentPath.substringAfter("/photo", "")
+                    if (sub.startsWith("/")) "nas$sub" else if (sub.isNotEmpty()) "nas/$sub" else "nas"
+                } else if (file.path.startsWith("/homes/$username/google_photo_backup")) {
+                    val sub = parentPath.substringAfter("/homes/$username/google_photo_backup", "")
+                        if (sub.startsWith("/")) "nas$sub" else if (sub.isNotEmpty()) "nas/$sub" else "nas"
+                } else if (file.path.startsWith("/google_photo_backup")) {
+                    val sub = parentPath.substringAfter("/google_photo_backup", "")
+                        if (sub.startsWith("/")) "nas$sub" else if (sub.isNotEmpty()) "nas/$sub" else "nas"
                 } else {
+                    // Fallback or use job.sourcePath rel logic if needed? 
+                    // Let's stick to the "nas" root logic for consistency or fallback
                     "nas"
                 }
                 
@@ -190,8 +204,12 @@ class BackupService : Service() {
                      }
                  }
                  
+                 val currentMb = currentDownloadedBytes / (1024.0 * 1024.0)
+                 val totalMb = plannedDownloadBytes / (1024.0 * 1024.0)
+                 val progressStr = String.format("%.1f/%.1f MB", currentMb, totalMb)
+                 
                  val progress = ((index + 1) * 100) / realFilesToDownload.size
-                 BackupManager.statusMessage.value = "Downloading ${index+1}/${realFilesToDownload.size} ($etaStr): ${file.name}"
+                 BackupManager.statusMessage.value = "Downloading ${index+1}/${realFilesToDownload.size} ($progressStr$etaStr): ${file.name}"
                  BackupManager.progress.value = progress
                  
                  if (System.currentTimeMillis() - lastNotifyTime > 1000) {
@@ -204,32 +222,64 @@ class BackupService : Service() {
                      lastNotifyTime = System.currentTimeMillis()
                  }
                  
-                 // Download
-                 BackupManager.appendLog("Downloading: ${file.name} ($sizeStr)")
-                 val stream = repository.downloadFile(file.path) { err ->
-                     CoroutineScope(Dispatchers.Main).launch {
-                         BackupManager.appendLog("Stream Error ${file.name}: $err")
-                     }
-                 }
-                 
-                 if (stream != null) {
                     val fileParentPath = file.path.substringBeforeLast('/')
-                    val localSubDir = if (fileParentPath.length > job.sourcePath.length) {
-                        "nas" + fileParentPath.substring(job.sourcePath.length)
+                    val localSubDir = if (file.path.startsWith("/photo")) {
+                        val sub = fileParentPath.substringAfter("/photo", "")
+                        if (sub.startsWith("/")) "nas$sub" else if (sub.isNotEmpty()) "nas/$sub" else "nas"
+                    } else if (file.path.startsWith("/homes/$username/google_photo_backup")) {
+                        val sub = fileParentPath.substringAfter("/homes/$username/google_photo_backup", "")
+                        if (sub.startsWith("/")) "nas$sub" else if (sub.isNotEmpty()) "nas/$sub" else "nas"
+                    } else if (file.path.startsWith("/google_photo_backup")) {
+                        val sub = fileParentPath.substringAfter("/google_photo_backup", "")
+                        if (sub.startsWith("/")) "nas$sub" else if (sub.isNotEmpty()) "nas/$sub" else "nas"
                     } else {
                         "nas"
                     }
-                    val mtime = file.additional?.time?.mtime ?: 0L
-                    val lastModifiedMs = if (mtime > 0) mtime * 1000L else null
                     
-                    val success = saveToMediaStore(context, stream, file.name, localSubDir, remoteSize, lastModifiedMs) { err ->
-                        CoroutineScope(Dispatchers.Main).launch {
-                            BackupManager.appendLog("Save Error: $err")
+                    var success = false
+                    var attempt = 1
+
+                    while (!success) {
+                        if (attempt > 1) {
+                            BackupManager.statusMessage.value = "Downloading ${index+1}/${realFilesToDownload.size} ($progressStr$etaStr) [Retry $attempt]: ${file.name}"
+                            BackupManager.appendLog("Retry Attempt $attempt for ${file.path}...")
+                            kotlinx.coroutines.delay(3000)
+                        }
+
+                        // Download
+                        if (attempt == 1) { // Log only once or on failure
+                             BackupManager.appendLog("Downloading: ${file.path}")
+                             BackupManager.appendLog(" -> Dest: Downloads/$localSubDir/${file.name} ($sizeStr)")
+                        }
+
+                        val stream = repository.downloadFile(file.path) { err ->
+                             CoroutineScope(Dispatchers.Main).launch {
+                                 BackupManager.appendLog("Stream Error (Attempt $attempt) ${file.name}: $err")
+                             }
+                        }
+
+                        if (stream != null) {
+                            val mtime = file.additional?.time?.mtime ?: 0L
+                            val lastModifiedMs = if (mtime > 0) mtime * 1000L else null
+                            
+                            success = saveToMediaStore(context, stream, file.name, localSubDir, remoteSize, lastModifiedMs) { msg ->
+                                CoroutineScope(Dispatchers.Main).launch {
+                                    BackupManager.appendLog(msg)
+                                }
+                            }
+                        } else {
+                            BackupManager.appendLog("Download failed (Stream null). Retrying...")
+                        }
+
+                        if (!success) {
+                            attempt++
                         }
                     }
-                    
-                    if (success) {
-                        currentDownloadedBytes += remoteSize
+
+
+                        
+                        if (success) {
+                            currentDownloadedBytes += remoteSize
                         filesDone++
                         
                         if (job.moveOnNas) {
@@ -282,7 +332,6 @@ class BackupService : Service() {
                     } else {
                         BackupManager.appendLog(" - Save failed locally")
                     }
-                 }
              }
              
              // Cleanup empty dirs

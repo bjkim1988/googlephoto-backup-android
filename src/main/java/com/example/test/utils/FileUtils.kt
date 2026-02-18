@@ -47,7 +47,7 @@ fun findFileInMediaStore(context: Context, fileName: String, subDir: String): Lo
     return null
 }
 
-suspend fun saveToMediaStore(context: Context, inputStream: InputStream, fileName: String, subDir: String, expectedSize: Long, lastModified: Long? = null, onError: (String) -> Unit = {}): Boolean {
+suspend fun saveToMediaStore(context: Context, inputStream: InputStream, fileName: String, subDir: String, expectedSize: Long, lastModified: Long? = null, onLog: (String) -> Unit = {}): Boolean {
     val ext = fileName.substringAfterLast('.', "").lowercase(Locale.ROOT)
     val isImage = ext in setOf("jpg", "jpeg", "png", "webp", "heic")
     val isMp4Video = ext in setOf("mp4", "mov")
@@ -65,27 +65,56 @@ suspend fun saveToMediaStore(context: Context, inputStream: InputStream, fileNam
 
     return withContext(Dispatchers.IO) {
         try {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                val values = ContentValues().apply {
-                    put(MediaStore.MediaColumns.DISPLAY_NAME, fileName)
-                    put(MediaStore.MediaColumns.MIME_TYPE, mimeType)
-                    put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS + "/$subDir/")
-                    put(MediaStore.MediaColumns.IS_PENDING, 1)
-                    if (lastModified != null && lastModified > 0) {
-                        put(MediaStore.MediaColumns.DATE_MODIFIED, lastModified / 1000)
-                        put(MediaStore.MediaColumns.DATE_ADDED, lastModified / 1000)
-                        put(MediaStore.MediaColumns.DATE_TAKEN, lastModified)
+        val canUseFileApi = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            Environment.isExternalStorageManager()
+        } else {
+            Build.VERSION.SDK_INT < Build.VERSION_CODES.Q
+        }
+
+            if (!canUseFileApi) {
+                // Use MediaStore (Scopred Storage)
+                onLog("Saving via MediaStore API...")
+                val resolver = context.contentResolver
+                var uri: android.net.Uri? = null
+                var currentFileName = fileName
+                var retryCount = 0
+                
+                while (uri == null && retryCount < 3) {
+                    val values = ContentValues().apply {
+                        put(MediaStore.MediaColumns.DISPLAY_NAME, currentFileName)
+                        put(MediaStore.MediaColumns.MIME_TYPE, mimeType)
+                        put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS + "/$subDir/")
+                        put(MediaStore.MediaColumns.IS_PENDING, 1)
+                        if (lastModified != null && lastModified > 0) {
+                            put(MediaStore.MediaColumns.DATE_MODIFIED, lastModified / 1000)
+                            put(MediaStore.MediaColumns.DATE_ADDED, lastModified / 1000)
+                            put(MediaStore.MediaColumns.DATE_TAKEN, lastModified)
+                        }
+                    }
+                    
+                    try {
+                        uri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
+                    } catch (e: Exception) {
+                        onLog("Insert Exception: ${e.message}")
+                    }
+                    
+                    if (uri == null) {
+                        onLog("MediaStore insert failed for $currentFileName. Retrying with new name...")
+                        val nameNoExt = fileName.substringBeforeLast('.')
+                        val extPart = fileName.substringAfterLast('.', "")
+                        val dot = if (extPart.isNotEmpty()) "." else ""
+                        currentFileName = "${nameNoExt}_${System.currentTimeMillis()}$dot$extPart"
+                        retryCount++
                     }
                 }
                 
-                val resolver = context.contentResolver
-                val uri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
                 if (uri == null) {
-                    onError("MediaStore insert failed (uri is null)")
+                    onLog("Error: MediaStore insert failed permanently (uri is null). Check permissions.")
                     return@withContext false
                 }
                 
-                uri.let {
+                val finalUri = uri!!
+                finalUri.let {
                     resolver.openOutputStream(it)?.use { outputStream ->
                         inputStream.copyTo(outputStream)
                     }
@@ -97,13 +126,18 @@ suspend fun saveToMediaStore(context: Context, inputStream: InputStream, fileNam
                                 val exif = ExifInterface(pfd.fileDescriptor)
                                 val existing = exif.getAttribute(ExifInterface.TAG_DATETIME_ORIGINAL)
                                 if (existing.isNullOrEmpty()) {
+                                    onLog("Metadata: No EXIF Date in $currentFileName. Injecting NAS time...")
                                     val sdf = SimpleDateFormat("yyyy:MM:dd HH:mm:ss", Locale.US)
                                     exif.setAttribute(ExifInterface.TAG_DATETIME_ORIGINAL, sdf.format(Date(lastModified)))
                                     exif.setAttribute(ExifInterface.TAG_DATETIME, sdf.format(Date(lastModified)))
                                     exif.saveAttributes()
+                                    onLog("Metadata: EXIF Injection Success.")
+                                } else {
+                                    onLog("Metadata: EXIF Date exists. Skipping injection.")
                                 }
                             }
                         } catch (e: Exception) {
+                            onLog("Metadata: EXIF Injection Failed: ${e.message}")
                             e.printStackTrace()
                         }
                     }
@@ -120,38 +154,39 @@ suspend fun saveToMediaStore(context: Context, inputStream: InputStream, fileNam
                                 channel.close()
                                 fis.close()
                                 
-                                injectMp4CreationDate(tempFile, lastModified)
-                                
-                                // Write back
-                                resolver.openOutputStream(it, "wt")?.use { os ->
-                                    tempFile.inputStream().use { input -> input.copyTo(os) }
+                                onLog("Metadata: Checking MP4 atoms for $currentFileName...")
+                                val injected = injectMp4CreationDate(tempFile, lastModified)
+                                if (injected) {
+                                    onLog("Metadata: MP4 Creation Time injected.")
+                                    // Write back only if changed
+                                    resolver.openOutputStream(it, "wt")?.use { os ->
+                                        tempFile.inputStream().use { input -> input.copyTo(os) }
+                                    }
+                                } else {
+                                     onLog("Metadata: MP4 time already set or not found.")
                                 }
                                 tempFile.delete()
                             }
                         } catch (e: Exception) {
+                             onLog("Metadata: MP4 Injection Failed: ${e.message}")
                             e.printStackTrace()
                         }
                     }
 
-                    values.clear()
-                    values.put(MediaStore.MediaColumns.IS_PENDING, 0)
-                    resolver.update(it, values, null, null)
+                    val updateValues = ContentValues()
+                    updateValues.put(MediaStore.MediaColumns.IS_PENDING, 0)
+                    resolver.update(it, updateValues, null, null)
                     true
                 } ?: false
             } else {
+                onLog("Saving via File API...")
                 val targetDir = File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS), subDir)
                 if (!targetDir.exists()) targetDir.mkdirs()
                 val targetFile = File(targetDir, fileName)
                 
-                var finalFile = targetFile
-                var v = 1
-                val name = fileName.substringBeforeLast('.')
-                val extPart = fileName.substringAfterLast('.', "")
-                val dot = if (extPart.isNotEmpty()) "." else ""
-                
-                while (finalFile.exists()) {
-                   finalFile = File(targetDir, "${name}_$v$dot$extPart")
-                   v++
+                val finalFile = targetFile
+                if (finalFile.exists()) {
+                    onLog("File exists. Overwriting: $fileName")
                 }
                 
                 FileOutputStream(finalFile).use { outputStream ->
@@ -169,12 +204,17 @@ suspend fun saveToMediaStore(context: Context, inputStream: InputStream, fileNam
                         val exif = ExifInterface(finalFile.absolutePath)
                         val existing = exif.getAttribute(ExifInterface.TAG_DATETIME_ORIGINAL)
                         if (existing.isNullOrEmpty()) {
+                            onLog("Metadata: No EXIF Date. Injecting NAS time...")
                             val sdf = SimpleDateFormat("yyyy:MM:dd HH:mm:ss", Locale.US)
                             exif.setAttribute(ExifInterface.TAG_DATETIME_ORIGINAL, sdf.format(Date(lastModified)))
                             exif.setAttribute(ExifInterface.TAG_DATETIME, sdf.format(Date(lastModified)))
                             exif.saveAttributes()
+                            onLog("Metadata: EXIF Injection Success.")
+                        } else {
+                            onLog("Metadata: EXIF Date exists.")
                         }
                     } catch (e: Exception) {
+                        onLog("Metadata: EXIF Injection Failed: ${e.message}")
                         e.printStackTrace()
                     }
                 }
@@ -182,18 +222,23 @@ suspend fun saveToMediaStore(context: Context, inputStream: InputStream, fileNam
                 // Inject MP4 creation_time if missing (mp4/mov videos)
                 if (lastModified != null && lastModified > 0 && isMp4Video) {
                     try {
-                        injectMp4CreationDate(finalFile, lastModified)
+                        onLog("Metadata: Checking MP4 atoms...")
+                        val injected = injectMp4CreationDate(finalFile, lastModified)
+                        if (injected) onLog("Metadata: MP4 Creation Time injected.")
+                        else onLog("Metadata: MP4 time already set.")
                     } catch (e: Exception) {
+                        onLog("Metadata: MP4 Injection Failed: ${e.message}")
                         e.printStackTrace()
                     }
                 }
 
+                android.media.MediaScannerConnection.scanFile(context, arrayOf(finalFile.absolutePath), null, null)
                 true
             }
         } catch (e: Exception) {
             e.printStackTrace()
             // Invoke callback with error message
-            onError("Save error: ${e.message}")
+            onLog("Save error: ${e.message}")
             false
         }
     }
@@ -204,9 +249,10 @@ suspend fun saveToMediaStore(context: Context, inputStream: InputStream, fileNam
  * MP4 epoch starts 1904-01-01 (offset = 2082844800 seconds from Unix epoch).
  * Only writes if the existing creation_time is 0.
  */
-fun injectMp4CreationDate(file: File, lastModifiedMs: Long) {
+fun injectMp4CreationDate(file: File, lastModifiedMs: Long): Boolean {
     val MP4_EPOCH_OFFSET = 2082844800L
     val mp4Time = (lastModifiedMs / 1000) + MP4_EPOCH_OFFSET
+    var injected = false
 
     val raf = RandomAccessFile(file, "rw")
     try {
@@ -242,8 +288,7 @@ fun injectMp4CreationDate(file: File, lastModifiedMs: Long) {
         }
 
         if (moovPos < 0) {
-            raf.close()
-            return
+            return false
         }
 
         // Find mvhd atom inside moov
@@ -284,6 +329,7 @@ fun injectMp4CreationDate(file: File, lastModifiedMs: Long) {
                         raf.seek(creationTimePos)
                         raf.writeInt(mp4Time.toInt()) // creation_time
                         raf.writeInt(mp4Time.toInt()) // modification_time
+                        injected = true
                     }
                 } else if (version == 1) {
                     // 8-byte timestamps
@@ -294,6 +340,7 @@ fun injectMp4CreationDate(file: File, lastModifiedMs: Long) {
                         raf.seek(creationTimePos)
                         raf.writeLong(mp4Time) // creation_time
                         raf.writeLong(mp4Time) // modification_time
+                        injected = true
                     }
                 }
                 break
@@ -303,6 +350,7 @@ fun injectMp4CreationDate(file: File, lastModifiedMs: Long) {
     } finally {
         raf.close()
     }
+    return injected
 }
 
 fun appendLog(context: Context, msg: String) {

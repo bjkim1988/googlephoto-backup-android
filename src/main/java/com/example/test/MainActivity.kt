@@ -653,7 +653,11 @@ fun SynologyDownloaderApp(repository: SynologyRepository) {
                 onValueChange = { sourcePath = it.text },
                 label = { Text("Source Path") },
                 modifier = Modifier.fillMaxWidth(),
-                singleLine = true
+                singleLine = true,
+                keyboardOptions = KeyboardOptions(imeAction = androidx.compose.ui.text.input.ImeAction.Done),
+                keyboardActions = androidx.compose.foundation.text.KeyboardActions(
+                    onDone = { refreshList(sourcePath) }
+                )
             )
             
     var isSelectionMode by remember { mutableStateOf(false) }
@@ -1135,35 +1139,23 @@ fun SynologyDownloaderApp(repository: SynologyRepository) {
                             modifier = Modifier.weight(1f),
                             contentPadding = PaddingValues(horizontal = 4.dp),
                             onClick = {
-                                scope.launch {
-                                    localStatusMessage = "Downloading all..."
-                                    var count = 0
-                                    withContext(Dispatchers.IO) {
-                                         val filesToDownload = fileList.filter { !it.isdir }
-                                         filesToDownload.forEach { file ->
-                                            val stream = repository.downloadFile(file.path) { err ->
-                                                scope.launch(Dispatchers.Main) {
-
-                                                    appendLog(context, "Stream Error ${file.name}: $err")
-                                                }
-                                            }
-                                            if (stream != null) {
-                                                val mtime = file.additional?.time?.mtime ?: 0L
-                                                val lastModifiedMs = if (mtime > 0) mtime * 1000L else null
-                                                saveToMediaStore(context, stream, file.name, "SynologyDownloader", 0, lastModifiedMs) { err ->
-                                                    scope.launch(Dispatchers.Main) {
-
-                                                        appendLog(context, "Download failed: $err")
-                                                    }
-                                                }
-                                                count++
-                                                withContext(Dispatchers.Main) {
-                                                        localStatusMessage = "Downloaded $count files..."
-                                                }
-                                            }
-                                        }
+                                // Recursive Download (Download All including subdirs)
+                                val newJob = BackupJob.RecursiveBackup(sourcePath, moveOnNas = false)
+                                
+                                if (isBackupRunning && currentBackupLabel == newJob.label) {
+                                    Toast.makeText(context, "Task is currently running!", Toast.LENGTH_SHORT).show()
+                                } else if (backupQueue.any { it.label == newJob.label }) {
+                                     Toast.makeText(context, "Task is already in queue!", Toast.LENGTH_SHORT).show()
+                                } else {
+                                    BackupManager.addToQueue(newJob)
+                                    val intent = Intent(context, BackupService::class.java)
+                                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                                        context.startForegroundService(intent)
+                                    } else {
+                                        context.startService(intent)
                                     }
-                                    localStatusMessage = "Download completed ($count files)"
+                                    localStatusMessage = "Queued Full Download: $sourcePath"
+                                    logToUiAndFile(context, "Queued Recursive Download: $sourcePath")
                                 }
                             }
                         ) {
@@ -1207,6 +1199,7 @@ fun SynologyDownloaderApp(repository: SynologyRepository) {
                     
                     if (showDebugLog) {
                     val scrollState = rememberScrollState()
+                    var oldMax by remember { mutableStateOf(0) }
                     
                     // Initial scroll to bottom
                     LaunchedEffect(Unit) {
@@ -1216,13 +1209,15 @@ fun SynologyDownloaderApp(repository: SynologyRepository) {
                     
                     // Smart auto-scroll: Only scroll if user is already at the bottom
                     LaunchedEffect(scrollState.maxValue) {
-                        if (scrollState.maxValue > 0) {
-                             val dist = scrollState.maxValue - scrollState.value
-                             // Threshold: 200px. If close to bottom, update to new bottom.
-                             if (dist < 200) {
-                                  scrollState.scrollTo(scrollState.maxValue)
-                             }
-                        }
+                         val newMax = scrollState.maxValue
+                         val currentScroll = scrollState.value
+                         // Check if we were at bottom relative to OLD max
+                         val wasAtBottom = (oldMax - currentScroll) < 100
+                         
+                         if (wasAtBottom || oldMax == 0) {
+                              scrollState.scrollTo(newMax)
+                         }
+                         oldMax = newMax
                     }
                     
                     Box(

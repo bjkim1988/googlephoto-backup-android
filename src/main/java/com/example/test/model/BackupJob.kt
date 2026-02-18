@@ -8,7 +8,7 @@ sealed class BackupJob {
     abstract val moveOnNas: Boolean
     
     data class RecursiveBackup(override val sourcePath: String, override val moveOnNas: Boolean = true) : BackupJob() {
-        override val label = "Full Backup: $sourcePath"
+        override val label = if (moveOnNas) "Backup: $sourcePath" else "Download: $sourcePath"
     }
     
     data class SelectedBackup(
@@ -16,6 +16,6 @@ sealed class BackupJob {
         override val sourcePath: String, 
         override val moveOnNas: Boolean = true
     ) : BackupJob() {
-        override val label = "Selected: ${files.size} files" + if (!moveOnNas) " (Download Only)" else ""
+        override val label = if (moveOnNas) "Backup (${files.size} files)" else "Download (${files.size} files)"
     }
 }
