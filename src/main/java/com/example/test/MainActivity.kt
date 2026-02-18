@@ -4,6 +4,8 @@ import android.Manifest
 import android.content.ContentValues
 import android.content.Context
 import android.os.Build
+import android.app.Activity
+import androidx.activity.compose.BackHandler
 import android.os.Bundle
 import android.os.Environment
 import android.provider.MediaStore
@@ -43,6 +45,7 @@ import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.TextUnit
 import com.example.test.network.FileInfo
+import com.example.test.network.AdditionalInfo
 import com.example.test.repository.SynologyRepository
 import com.example.test.ui.theme.TestTheme
 import androidx.compose.ui.text.style.TextOverflow
@@ -59,6 +62,8 @@ import androidx.compose.material3.TextButton
 import androidx.compose.foundation.layout.heightIn
 import java.io.FileOutputStream
 import java.io.InputStream
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.launch
 import java.io.RandomAccessFile
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
@@ -66,9 +71,23 @@ import android.media.ExifInterface
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import java.util.Calendar
+import android.content.Intent
+import com.example.test.model.BackupJob
+import com.example.test.service.BackupManager
+import com.example.test.service.BackupService
+import com.example.test.utils.appendLog
+import com.example.test.utils.readLastLog
+import com.example.test.utils.findFileInMediaStore
+import com.example.test.utils.saveToMediaStore
 
-import android.app.Activity
-import androidx.activity.compose.BackHandler
+fun logToUiAndFile(context: Context, msg: String) {
+    BackupManager.appendLog(msg)
+    appendLog(context, msg)
+}
+
+
+
 
 class MainActivity : ComponentActivity() {
 
@@ -90,15 +109,7 @@ class MainActivity : ComponentActivity() {
     }
 }
 
-sealed class BackupJob {
-    abstract val label: String
-    data class RecursiveBackup(val sourcePath: String) : BackupJob() {
-        override val label = "Full Backup: $sourcePath"
-    }
-    data class SelectedBackup(val files: List<FileInfo>, val sourcePath: String) : BackupJob() {
-        override val label = "Selected: ${files.size} files"
-    }
-}
+
 
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
@@ -118,9 +129,9 @@ fun SynologyDownloaderApp(repository: SynologyRepository) {
     var password by remember { mutableStateOf("") }
     var otpCode by remember { mutableStateOf("") }
     var sourcePath by remember { mutableStateOf("/photo") }
-    var statusMessage by remember { mutableStateOf("Ready") }
+
     var fileList by remember { mutableStateOf<List<FileInfo>>(emptyList()) }
-    var debugLog by remember { mutableStateOf("") }
+
     var isLoggedIn by remember { mutableStateOf(false) }
     
     var isSelectionMode by remember { mutableStateOf(false) }
@@ -138,11 +149,32 @@ fun SynologyDownloaderApp(repository: SynologyRepository) {
     var discoveredNas by remember { mutableStateOf<List<String>>(emptyList()) }
     var isScanning by remember { mutableStateOf(false) }
     
-    // Backup queue
-    var backupQueue by remember { mutableStateOf<List<BackupJob>>(emptyList()) }
-    var isBackupRunning by remember { mutableStateOf(false) }
-    var currentBackupLabel by remember { mutableStateOf("") }
+    // Backup queue (Managed by BackupManager)
+    val backupQueue by com.example.test.service.BackupManager.queue.collectAsState()
+    val isBackupRunning by com.example.test.service.BackupManager.isBackupRunning.collectAsState()
+    // Local status for non-backup ops, or shared?
+    // Let's keep local statusMessage for Login/Listing, but observe BackupManager for updates?
+    // Actually, let's mix them.
+    var localStatusMessage by remember { mutableStateOf("Ready") }
+    val serviceStatusMessage by com.example.test.service.BackupManager.statusMessage.collectAsState()
+    
+    // Derived status: if backup running, show service status, else local
+    val statusMessage = if (isBackupRunning) serviceStatusMessage else localStatusMessage
+    
+    // Debug Log: Service log + Local log?
+    // Let's use BackupManager.debugLog as the source of truth if possible, or just append local logs to it.
+    val debugLog by com.example.test.service.BackupManager.debugLog.collectAsState()
+    
+    var currentBackupLabel by remember { mutableStateOf("") } // Start/Stop logic needs this? 
+    // Actually BackupManager doesn't expose current label directly except via status?
+    // We can filter queue to guess.
+    // Or add currentJobLabel to BackupManager.
+    
     var activeBackupJob by remember { mutableStateOf<Job?>(null) }
+    
+    LaunchedEffect(Unit) {
+        com.example.test.service.BackupManager.repository = repository
+    }
     
     // Leftover files handling
     var leftoverFiles by remember { mutableStateOf<List<FileInfo>>(emptyList()) }
@@ -159,11 +191,24 @@ fun SynologyDownloaderApp(repository: SynologyRepository) {
     LaunchedEffect(Unit) {
         val lastLog = withContext(Dispatchers.IO) { readLastLog(context) }
         if (lastLog.isNotEmpty()) {
-            debugLog = "--- LAST SESSION LOG (Potential Crash Context) ---\n$lastLog\n--------------------------\n"
+            BackupManager.debugLog.value = "--- LAST SESSION LOG (Potential Crash Context) ---\n$lastLog\n--------------------------\n"
         }
     }
 
     LaunchedEffect(Unit) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            val pm = context.getSystemService(Context.POWER_SERVICE) as android.os.PowerManager
+            if (!pm.isIgnoringBatteryOptimizations(context.packageName)) {
+                 try {
+                     val intent = Intent(android.provider.Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS)
+                     intent.data = android.net.Uri.parse("package:${context.packageName}")
+                     context.startActivity(intent)
+                 } catch (e: Exception) {
+                     e.printStackTrace()
+                 }
+            }
+        }
+
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
             launcher.launch(
                 arrayOf(
@@ -176,17 +221,17 @@ fun SynologyDownloaderApp(repository: SynologyRepository) {
 
     val refreshList = { path: String ->
         scope.launch {
-            statusMessage = "Listing files..."
+            localStatusMessage = "Listing files..."
             withContext(Dispatchers.IO) {
                 try {
                     val files = repository.listFiles(path)
                     withContext(Dispatchers.Main) {
                         fileList = files
-                        statusMessage = "Files listed: ${files.size}"
+                        localStatusMessage = "Files listed: ${files.size}"
                     }
                 } catch (e: Exception) {
                     withContext(Dispatchers.Main) {
-                        statusMessage = "Error listing files: ${e.message}"
+                        localStatusMessage = "Error listing files: ${e.message}"
                     }
                 }
             }
@@ -205,382 +250,8 @@ fun SynologyDownloaderApp(repository: SynologyRepository) {
         }
     }
 
-    // Queue processor
-    LaunchedEffect(Unit) {
-        snapshotFlow { backupQueue to isBackupRunning }
-            .collect { (queue, running) ->
-                if (queue.isNotEmpty() && !running) {
-            val job = queue.first()
-            backupQueue = backupQueue.drop(1)
-            isBackupRunning = true
-            currentBackupLabel = job.label
-            
-            activeBackupJob = scope.launch {
-                val powerManager = context.getSystemService(Context.POWER_SERVICE) as? android.os.PowerManager
-                val wakeLock = powerManager?.newWakeLock(android.os.PowerManager.PARTIAL_WAKE_LOCK, "SynologyDownloader::Backup")
-                
-                // Setup Notification
-                val notificationManager = context.getSystemService(Context.NOTIFICATION_SERVICE) as android.app.NotificationManager
-                val notificationId = 1
-                
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                    val channel = android.app.NotificationChannel("backup_channel", "Backup Progress", android.app.NotificationManager.IMPORTANCE_LOW).apply {
-                        description = "Shows backup progress"
-                    }
-                    notificationManager.createNotificationChannel(channel)
-                }
-                
-                // Build intent to launch app on click
-                val intent = android.content.Intent(context, MainActivity::class.java).apply {
-                    flags = android.content.Intent.FLAG_ACTIVITY_SINGLE_TOP or android.content.Intent.FLAG_ACTIVITY_CLEAR_TOP
-                }
-                val pendingIntent = android.app.PendingIntent.getActivity(
-                    context, 0, intent,
-                    android.app.PendingIntent.FLAG_UPDATE_CURRENT or android.app.PendingIntent.FLAG_IMMUTABLE
-                )
+    // Queue processor removed (handled by Service)
 
-                val notificationBuilder = NotificationCompat.Builder(context, "backup_channel")
-                    .setSmallIcon(android.R.drawable.stat_sys_download)
-                    .setContentTitle("Synology Backup")
-                    .setContentIntent(pendingIntent)
-                    .setPriority(NotificationCompat.PRIORITY_LOW)
-                    .setOngoing(true)
-                    .setOnlyAlertOnce(true)
-                
-                if (wakeLock != null) {
-                    wakeLock.acquire(10 * 60 * 60 * 1000L) // 10 hours max
-                    appendLog(context, "WakeLock acquired")
-                }
-
-                try {
-                val maxBytes = 50 * 1024 * 1024L
-                
-                val jobSourcePath = when (job) {
-                    is BackupJob.RecursiveBackup -> job.sourcePath
-                    is BackupJob.SelectedBackup -> job.sourcePath
-                }
-                
-                debugLog += "=== Queue: Starting ${job.label} ===\n"
-                appendLog(context, "=== Queue: Starting ${job.label} ===")
-                statusMessage = "Running: ${job.label}"
-                
-                withContext(Dispatchers.IO) {
-                val freeSpace = Environment.getExternalStorageDirectory().freeSpace
-                val reservedSpace = 10L * 1024 * 1024 * 1024 // 10GB
-                val maxBytes = if (freeSpace > reservedSpace) freeSpace - reservedSpace else 0L
-                
-                if (maxBytes <= 0) {
-                    withContext(Dispatchers.Main) {
-                        statusMessage = "Error: Storage full (<10GB free)"
-                        showStorageErrorDialog = true
-                        debugLog += "Error: Insufficient storage (Require > 10GB free)\n"
-                    }
-                    throw Exception("Insufficient storage (<10GB free)")
-                }
-
-                withContext(Dispatchers.Main) {
-                    val freeGB = String.format("%.2f", freeSpace / (1024.0 * 1024.0 * 1024.0))
-                    val limitMB = String.format("%.2f", maxBytes / (1024.0 * 1024.0))
-                    debugLog += "Storage: ${freeGB}GB free. Reserving 10GB. Batch Limit: ${limitMB}MB\n"
-                }
-                
-                // Get files to process
-                val candidateFiles = when (job) {
-                    is BackupJob.RecursiveBackup -> {
-                        withContext(Dispatchers.Main) {
-                            debugLog += "Scanning all subdirectories from ${job.sourcePath}...\n"
-                            appendLog(context, "Scanning all subdirectories from ${job.sourcePath}...")
-                        }
-                        val files = repository.listFilesRecursive(job.sourcePath) { scanningPath ->
-                            withContext(Dispatchers.Main) {
-                                statusMessage = "Scanning: $scanningPath"
-                            }
-                        }
-                        withContext(Dispatchers.Main) {
-                            debugLog += "Found ${files.size} files total\n"
-                            appendLog(context, "Found ${files.size} files total")
-                        }
-                        files
-                    }
-                    is BackupJob.SelectedBackup -> job.files
-                }
-
-                // Identify files to process (images/videos) vs leftovers
-                val imageExtensions = setOf("jpg", "jpeg", "png", "gif", "bmp", "webp", "heic", "heif", "tiff", "svg", "raw", "cr2", "nef", "arw", "dng")
-                val videoExtensions = setOf("mp4", "mov", "avi", "mkv", "wmv", "flv", "webm", "m4v", "3gp", "mpeg", "mpg")
-
-                val filesToDownload = mutableListOf<FileInfo>()
-                val nonMediaFiles = mutableListOf<FileInfo>()
-                
-                var plannedDownloadBytes = 0L
-                
-                for (file in candidateFiles) {
-                     val ext = file.name.substringAfterLast('.', "").lowercase()
-                     if (ext in imageExtensions || ext in videoExtensions) {
-                         // Check size/existence logic
-                         val remoteSize = file.additional?.size ?: 0L
-                         // Compute local path (simplified check here, detailed in loop)
-                         // We just filter based on type for now, existence check is done inside or here.
-                         // Let's reuse existing existence logic if possible, or move it here.
-                         // To keep it simple and safe, we just check extension here for splitting.
-                         // But we must also check existence to filter out ALREADY BACKED UP files from filesToDownload.
-                         // Leftovers are simply those that are NOT media.
-                         // Be careful: if a file is media but already backed up, it is NOT a leftover.
-                         filesToDownload.add(file)
-                     } else {
-                         nonMediaFiles.add(file)
-                     }
-                }
-                
-                // Filter filesToDownload for existence/size limits
-                val realFilesToDownload = mutableListOf<FileInfo>()
-                 for (file in filesToDownload) {
-                        if (plannedDownloadBytes >= maxBytes) break
-                        val remoteSize = file.additional?.size ?: 0L
-                        // Compute local subdirectory mirroring NAS folder structure
-                        val parentPath = file.path.substringBeforeLast('/')
-                        val localSubDir = if (parentPath.length > "/photo".length) {
-                            "nas" + parentPath.substring("/photo".length)
-                        } else {
-                            "nas"
-                        }
-                        val localDir = File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS), localSubDir)
-                        val targetFile = File(localDir, file.name)
-                        if (targetFile.exists() && targetFile.length() == remoteSize) continue
-                        
-                        realFilesToDownload.add(file)
-                        plannedDownloadBytes += remoteSize
-                    }
-                    
-                    withContext(Dispatchers.Main) {
-                        debugLog += "Backup Plan: ${realFilesToDownload.size} files, approx ${plannedDownloadBytes / 1024} KB\n"
-                        appendLog(context, "Backup Plan: ${realFilesToDownload.size} files, approx ${plannedDownloadBytes / 1024} KB")
-                        if (nonMediaFiles.isNotEmpty()) {
-                            leftoverFiles = nonMediaFiles
-                            showLeftoverDialog = true
-                        }
-                    }
-                    
-                    var currentDownloadedBytes = 0L
-                    var filesDone = 0
-                    val backupStartTime = System.currentTimeMillis()
-                    var lastNotifyTime = 0L
-                    
-                    for ((index, file) in realFilesToDownload.withIndex()) {
-                        val remoteSize = file.additional?.size ?: 0L
-                        val sizeStr = when {
-                            remoteSize >= 1024 * 1024 -> String.format("%.2f MB", remoteSize / (1024.0 * 1024.0))
-                            remoteSize >= 1024 -> String.format("%.2f KB", remoteSize / 1024.0)
-                            else -> "$remoteSize B"
-                        }
-                        
-                        if (!isBackupRunning) break // Allow stopping current job
-                        appendLog(context, "Start processing: ${file.name} ($sizeStr)")
-                        if (currentDownloadedBytes >= maxBytes) break
-                        
-                        try {
-                            withContext(Dispatchers.Main) {
-                                val currentMB = currentDownloadedBytes / (1024.0 * 1024.0)
-                                val totalMB = plannedDownloadBytes / (1024.0 * 1024.0)
-                                
-                                // ETA Calculation
-                                val elapsedTime = System.currentTimeMillis() - backupStartTime
-                                var etaStr = ""
-                                if (currentDownloadedBytes > 0 && elapsedTime > 2000) { // Wait 2s for stability
-                                    val bytesPerSec = (currentDownloadedBytes.toDouble() * 1000) / elapsedTime
-                                    val remainingBytes = plannedDownloadBytes - currentDownloadedBytes
-                                    if (bytesPerSec > 0) {
-                                        val remainingSeconds = (remainingBytes / bytesPerSec).toLong()
-                                        etaStr = if (remainingSeconds < 60) " ETA: ${remainingSeconds}s" 
-                                                 else if (remainingSeconds < 3600) " ETA: ${remainingSeconds/60}m ${remainingSeconds%60}s"
-                                                 else " ETA: ${remainingSeconds/3600}h ${(remainingSeconds%3600)/60}m"
-                                    }
-                                }
-
-                                // Update Notification (throttled to 1s)
-                                if (System.currentTimeMillis() - lastNotifyTime > 1000) {
-                                    val progress = ((index + 1) * 100) / realFilesToDownload.size
-                                    val cleanEta = if (etaStr.isNotBlank()) etaStr.replace(" ETA:", "") else "Calculating..."
-                                    val etaDisplay = if (cleanEta == "Calculating...") cleanEta else "$cleanEta left"
-                                    
-                                    notificationBuilder.setProgress(100, progress, false)
-                                        .setContentTitle("Backup: $progress% (${index + 1}/${realFilesToDownload.size}) - $etaDisplay")
-                                        .setContentText("${file.name} ($sizeStr)")
-                                        .setStyle(androidx.core.app.NotificationCompat.BigTextStyle()
-                                            .bigText("Path: ${file.path}\nSize: $sizeStr"))
-                                    
-                                    if (Build.VERSION.SDK_INT < 33 || androidx.core.content.ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) == android.content.pm.PackageManager.PERMISSION_GRANTED) {
-                                        notificationManager.notify(notificationId, notificationBuilder.build())
-                                    }
-                                    lastNotifyTime = System.currentTimeMillis()
-                                }
-
-                                val progressStr = if (totalMB > 921.6) { // 0.9 GB * 1024 MB/GB = 921.6 MB
-                                    String.format("%.2f/%.2f GB", currentMB / 1024.0, totalMB / 1024.0)
-                                } else {
-                                    String.format("%.1f/%.1f MB", currentMB, totalMB)
-                                }
-                                statusMessage = "Downloading ${index + 1}/${realFilesToDownload.size} ($progressStr$etaStr): ${file.name} ($sizeStr)"
-                                debugLog += "Start: ${file.name} ($sizeStr)\n"
-                            }
-                            
-                            val stream = repository.downloadFile(file.path)
-                            if (stream != null) {
-                                val context2 = context
-                                // Compute local subDir mirroring NAS folder tree
-                                val fileParentPath = file.path.substringBeforeLast('/')
-                                val localSubDir = if (fileParentPath.length > "/photo".length) {
-                                    "nas" + fileParentPath.substring("/photo".length)
-                                } else {
-                                    "nas"
-                                }
-                                val mtime = file.additional?.time?.mtime ?: 0L
-                                val lastModifiedMs = if (mtime > 0) mtime * 1000L else null
-                                val success = saveToMediaStore(context2, stream, file.name, localSubDir, remoteSize, lastModifiedMs)
-                                
-                                if (success) {
-                                    currentDownloadedBytes += remoteSize
-                                    filesDone++
-                                    withContext(Dispatchers.Main) {
-                                        debugLog += "Downloaded: ${file.name}. Moving on NAS...\n"
-                                        appendLog(context, "Downloaded: ${file.name}. Moving on NAS...")
-                                    }
-                                    
-                                    var destFolder = "/homes/$username/google_photo_backup"
-                                    if (file.path.startsWith("/photo/")) {
-                                        val parentPath = file.path.substringBeforeLast('/')
-                                        if (parentPath.length > "/photo".length) {
-                                            val subPath = parentPath.substring("/photo".length)
-                                            destFolder += subPath
-                                        }
-                                    }
-                                    
-                                    repository.createFolder(destFolder)
-                                    val moveSuccess = repository.moveFile(file.path, destFolder)
-                                    
-                                    withContext(Dispatchers.Main) {
-                                        if (moveSuccess) {
-                                            debugLog += " - Move to $destFolder: Success\n"
-                                            appendLog(context, " - Move to $destFolder: Success")
-                                        } else {
-                                            debugLog += " - Move: Failed\n"
-                                            appendLog(context, " - Move: Failed")
-                                        }
-                                    }
-                                    
-                                    if (moveSuccess) {
-                                        delay(1000)
-                                        var destFiles = repository.listFiles(destFolder)
-                                        var movedFileExists = destFiles.any { it.name == file.name }
-                                        if (!movedFileExists) {
-                                            delay(1000)
-                                            destFiles = repository.listFiles(destFolder)
-                                            movedFileExists = destFiles.any { it.name == file.name }
-                                        }
-                                        val sourceParentPath = file.path.substringBeforeLast('/')
-                                        val sourceFiles = repository.listFiles(sourceParentPath)
-                                        val sourceFileExists = sourceFiles.any { it.name == file.name }
-                                        
-                                        if (movedFileExists && sourceFileExists) {
-                                            val delResult = repository.deleteFile(file.path)
-                                            withContext(Dispatchers.Main) {
-                                                if (delResult == "Success") {
-                                                    debugLog += " - Auto-Fix: Source deleted\n"
-                                                    appendLog(context, " - Auto-Fix: Source deleted")
-                                                } else {
-                                                    debugLog += " - Auto-Fix Failed: $delResult\n"
-                                                    appendLog(context, " - Auto-Fix Failed: $delResult")
-                                                }
-                                            }
-                                        }
-                                    }
-                                    
-
-                                } else {
-                                    withContext(Dispatchers.Main) {
-                                        debugLog += "Failed to save: ${file.name}\n"
-                                        appendLog(context, "Failed to save: ${file.name}")
-                                    }
-                                }
-                            } else {
-                                withContext(Dispatchers.Main) {
-                                    debugLog += "Failed to open stream for ${file.name}\n"
-                                    appendLog(context, "Failed to open stream for ${file.name}")
-                                }
-                            }
-                        } catch (e: Exception) {
-                            withContext(Dispatchers.Main) {
-                                debugLog += "Error: ${file.name}: ${e.message}\n"
-                                appendLog(context, "Error: ${file.name}: ${e.message}")
-                            }
-                        }
-                    }
-                    
-                    // Clean up empty directories for recursive backups
-                    if (job is BackupJob.RecursiveBackup) {
-                        withContext(Dispatchers.Main) {
-                            debugLog += "Checking for empty directories...\n"
-                            appendLog(context, "Checking for empty directories...")
-                        }
-                        val dirsToCheck = mutableListOf<String>()
-                        val dirQueue = ArrayDeque<String>()
-                        dirQueue.add(job.sourcePath)
-                        while (dirQueue.isNotEmpty()) {
-                            val dir = dirQueue.removeFirst()
-                            val items = repository.listFiles(dir)
-                            for (item in items) {
-                                if (item.isdir) {
-                                    dirsToCheck.add(item.path)
-                                    dirQueue.add(item.path)
-                                }
-                            }
-                        }
-                        var deletedDirs = 0
-                        for (dir in dirsToCheck.reversed()) {
-                            val contents = repository.listFiles(dir)
-                            if (contents.isEmpty()) {
-                                val result = repository.deleteFile(dir)
-                                if (result == "Success") {
-                                    deletedDirs++
-                                    withContext(Dispatchers.Main) {
-                                        debugLog += "Deleted empty dir: $dir\n"
-                                        appendLog(context, "Deleted empty dir: $dir")
-                                    }
-                                }
-                            }
-                        }
-                        if (deletedDirs > 0) {
-                            withContext(Dispatchers.Main) {
-                                debugLog += "Cleaned up $deletedDirs empty directories\n"
-                                appendLog(context, "Cleaned up $deletedDirs empty directories")
-                            }
-                        }
-                    }
-                    
-                    withContext(Dispatchers.Main) {
-                        val totalMB = currentDownloadedBytes / (1024 * 1024)
-                        statusMessage = "Done: $filesDone files ($totalMB MB). Queue: ${backupQueue.size} remaining"
-                        debugLog += "=== Job complete: ${job.label} ===\n"
-                        appendLog(context, "=== Job complete: ${job.label} ===")
-                        refreshList(sourcePath)
-                    }
-                }
-            } catch (e: Exception) {
-                debugLog += "Queue job error: ${e.message}\n"
-                appendLog(context, "Queue job error: ${e.message}")
-            } finally {
-                notificationManager.cancel(notificationId)
-                if (wakeLock?.isHeld == true) {
-                    wakeLock.release()
-                    appendLog(context, "WakeLock released")
-                }
-                isBackupRunning = false
-                currentBackupLabel = ""
-            }
-            }
-            }
-        }
-    }
 
     Column(modifier = Modifier.padding(16.dp)) {
         if (!isLoggedIn) {
@@ -600,7 +271,7 @@ fun SynologyDownloaderApp(repository: SynologyRepository) {
                     scope.launch {
                         isScanning = true
                         discoveredNas = emptyList()
-                        statusMessage = "Scanning network..."
+                        localStatusMessage = "Scanning network..."
                         appendLog(context, "Scanning network for NAS...")
                         withContext(Dispatchers.IO) {
                             try {
@@ -615,22 +286,21 @@ fun SynologyDownloaderApp(repository: SynologyRepository) {
                                 val subnet = ip.substringBeforeLast('.')
                                 
                                 withContext(Dispatchers.Main) {
-                                    statusMessage = "Scanning $subnet.1-254 on port 5001..."
+                                    localStatusMessage = "Scanning $subnet.1-254 on port 5001..."
                                     appendLog(context, "Scanning $subnet.1-254 on port 5001...")
                                 }
                                 
                                 val found = repository.scanSubnet(subnet, 5001)
                                 withContext(Dispatchers.Main) {
                                     discoveredNas = found
-                                    statusMessage = if (found.isEmpty()) "No NAS found" else "Found ${found.size} device(s)"
+                                    localStatusMessage = if (found.isEmpty()) "No NAS found" else "Found ${found.size} device(s)"
                                     appendLog(context, if (found.isEmpty()) "No NAS found" else "Found ${found.size} device(s)")
                                     isScanning = false
                                 }
                             } catch (e: Exception) {
                                 withContext(Dispatchers.Main) {
-                                    statusMessage = "Scan error: ${e.message}"
-                                    debugLog += "Scan error: ${e.message}\n"
-                                    appendLog(context, "Scan error: ${e.message}")
+                                    localStatusMessage = "Scan error: ${e.message}"
+                                    logToUiAndFile(context, "Scan error: ${e.message}")
                                     isScanning = false
                                 }
                             }
@@ -740,9 +410,8 @@ fun SynologyDownloaderApp(repository: SynologyRepository) {
                 Spacer(modifier = Modifier.height(16.dp))
                 Button(onClick = {
                     scope.launch {
-                        statusMessage = "Logging in..."
-                        debugLog += "Attempting login to $host with user $username...\n"
-                        appendLog(context, "Attempting login to $host with user $username...")
+                        localStatusMessage = "Logging in..."
+                        logToUiAndFile(context, "Attempting login to $host with user $username...")
                         withContext(Dispatchers.IO) {
                             try {
                                 repository.init(host)
@@ -753,11 +422,12 @@ fun SynologyDownloaderApp(repository: SynologyRepository) {
                                     deviceId = deviceId
                                 )
                                 withContext(Dispatchers.Main) {
-                                    debugLog += "Result: ${result.message}\n"
-                                    appendLog(context, "Login Result: ${result.message}")
+                                    logToUiAndFile(context, "Login Result: ${result.message}")
                                     if (result.message == "Success") {
                                         isLoggedIn = true
-                                        statusMessage = "Logged in"
+                                        localStatusMessage = "Logged in"
+                                        BackupManager.username = username
+                                        BackupManager.host = host
                                         
                                         // Save device ID if returned
                                         if (result.did != null) {
@@ -774,17 +444,17 @@ fun SynologyDownloaderApp(repository: SynologyRepository) {
                                         
                                         refreshList(sourcePath)
                                     } else if (result.needsOtp) {
-                                        statusMessage = "OTP Required"
+                                        localStatusMessage = "OTP Required"
                                         loginStep = 4
                                     } else {
-                                        statusMessage = "Login failed"
+                                        localStatusMessage = "Login failed"
                                     }
                                 }
                             } catch (e: Exception) {
                                 withContext(Dispatchers.Main) {
                                     val msg = "Exception: ${e.message}"
-                                    statusMessage = "Error occured"
-                                    debugLog += "$msg\n"
+                                    localStatusMessage = "Error occured"
+                                    logToUiAndFile(context, msg)
                                 }
                             }
                         }
@@ -827,7 +497,7 @@ fun SynologyDownloaderApp(repository: SynologyRepository) {
                 Spacer(modifier = Modifier.height(16.dp))
                 Button(onClick = {
                     scope.launch {
-                        statusMessage = "Verifying OTP..."
+                        localStatusMessage = "Verifying OTP..."
                         withContext(Dispatchers.IO) {
                             try {
                                 repository.init(host)
@@ -839,10 +509,12 @@ fun SynologyDownloaderApp(repository: SynologyRepository) {
                                     deviceName = "SynologyDownloaderAndroid"
                                 )
                                 withContext(Dispatchers.Main) {
-                                    debugLog += "OTP Result: ${result.message}\n"
+                                    logToUiAndFile(context, "OTP Result: ${result.message}")
                                     if (result.message == "Success") {
                                         isLoggedIn = true
-                                        statusMessage = "Logged in"
+                                        localStatusMessage = "Logged in"
+                                        BackupManager.username = username
+                                        BackupManager.host = host
                                         
                                         // Save device ID for future OTP skip
                                         if (result.did != null) {
@@ -859,13 +531,13 @@ fun SynologyDownloaderApp(repository: SynologyRepository) {
                                         
                                         refreshList(sourcePath)
                                     } else {
-                                        statusMessage = "OTP Failed: ${result.message}"
+                                        localStatusMessage = "OTP Failed: ${result.message}"
                                     }
                                 }
                             } catch (e: Exception) {
                                 withContext(Dispatchers.Main) {
-                                    statusMessage = "Error: ${e.message}"
-                                    debugLog += "OTP Exception: ${e.message}\n"
+                                    localStatusMessage = "Error: ${e.message}"
+                                    logToUiAndFile(context, "OTP Exception: ${e.message}")
                                 }
                             }
                         }
@@ -1000,21 +672,21 @@ fun SynologyDownloaderApp(repository: SynologyRepository) {
                     
                     Button(onClick = {
                         scope.launch {
-                            statusMessage = "Deleting selected files..."
-                            debugLog = ""
+                            localStatusMessage = "Deleting selected files..."
+                            BackupManager.debugLog.value = ""
                             val filesToDelete = selectedFiles.toList()
                             var successCount = 0
                             
                             withContext(Dispatchers.IO) {
                                 for (file in filesToDelete) {
-                                    withContext(Dispatchers.Main) { debugLog += "Deleting ${file.name}...\n" }
+                                    withContext(Dispatchers.Main) { logToUiAndFile(context, "Deleting ${file.name}...") }
                                     val result = repository.deleteFile(file.path)
                                     withContext(Dispatchers.Main) {
                                         if (result == "Success") {
-                                            debugLog += " - Success\n"
+                                            logToUiAndFile(context, " - Success")
                                             successCount++
                                         } else {
-                                            debugLog += " - Failed: $result\n"
+                                            logToUiAndFile(context, " - Failed: $result")
                                         }
                                     }
                                 }
@@ -1022,7 +694,7 @@ fun SynologyDownloaderApp(repository: SynologyRepository) {
                             
                             isSelectionMode = false
                             selectedFiles = emptySet()
-                            statusMessage = "Deleted $successCount files"
+                            localStatusMessage = "Deleted $successCount files"
                             withContext(Dispatchers.Main) {
                                 refreshList(sourcePath)
                             }
@@ -1033,92 +705,23 @@ fun SynologyDownloaderApp(repository: SynologyRepository) {
                 }
                 Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     Button(modifier = Modifier.weight(1f), onClick = {
-                        scope.launch {
-                             statusMessage = "Downloading selected files..."
-                            debugLog = ""
-                            
-                            val filesToDownload = selectedFiles.filter { !it.isdir }.toList()
-                            var count = 0
-                            var totalBytes = 0L
-                            
-                            withContext(Dispatchers.IO) {
-                                for (file in filesToDownload) {
-                                    try {
-                                        val remoteSize = file.additional?.size ?: 0L
-                                        
-                                        withContext(Dispatchers.Main) {
-                                            debugLog += "Processing ${file.name}...\n"
-                                        }
-
-                                        // Check if exists
-                                        val existingSize = findFileInMediaStore(context, file.name, "nas")
-                                        
-                                        if (existingSize != null) {
-                                            if (existingSize == remoteSize) {
-                                                withContext(Dispatchers.Main) {
-                                                    debugLog += " - Skipped (Identical file exists)\n"
-                                                }
-                                                continue
-                                            }
-                                            withContext(Dispatchers.Main) {
-                                                 debugLog += " - File exists (size diff), saving new version...\n"
-                                            }
-                                            // MediaStore will auto-rename (e.g. file(1).txt) if we insert again.
-                                            // Or we could handle renaming manually if strict about "backup" names.
-                                            // For "Download Selected", standard system behavior (auto-rename) is usually preferred.
-                                        }
-
-                                        withContext(Dispatchers.Main) {
-                                            statusMessage = "Downloading ${file.name}..."
-                                        }
-
-                                        val stream = repository.downloadFile(file.path)
-                                        if (stream != null) {
-                                            val mtime = file.additional?.time?.mtime ?: 0L
-                                            val lastModifiedMs = if (mtime > 0) mtime * 1000L else null
-                                            val success = saveToMediaStore(context, stream, file.name, "nas", remoteSize, lastModifiedMs)
-                                            if (success) {
-                                                totalBytes += remoteSize
-                                                // Check if we crossed another 100MB threshold
-                                                if (totalBytes >= 100 * 1024 * 1024) {
-                                                     totalBytes = 0 // Reset counter or accumulate? User said "every 100MB". 
-                                                     // Let's reset purely for trigger efficiency or keep it running? 
-                                                     // Simpler: Just trigger update.
-                                                     refreshStorageTrigger++
-                                                     totalBytes = 0
-                                                }
-                                                
-                                                count++
-                                                withContext(Dispatchers.Main) {
-                                                    debugLog += " - Download Success\n"
-                                                }
-                                            } else {
-                                                withContext(Dispatchers.Main) {
-                                                    debugLog += " - Failed to save locally\n"
-                                                }
-                                            }
-                                        } else {
-                                            withContext(Dispatchers.Main) {
-                                                debugLog += " - Failed: InputStream was null\n"
-                                            }
-                                        }
-                                    } catch (e: Exception) {
-                                        withContext(Dispatchers.Main) {
-                                           debugLog += " - Error: ${e.message}\n"
-                                           e.printStackTrace()
-                                        }
-                                    }
-                                }
+                        val files = selectedFiles.filter { !it.isdir }.toList()
+                        // Download Only (moveOnNas = false)
+                        val newJob = BackupJob.SelectedBackup(files, sourcePath, moveOnNas = false)
+                        
+                         if (backupQueue.any { it.label == newJob.label }) {
+                             Toast.makeText(context, "Task is already in queue!", Toast.LENGTH_SHORT).show()
+                        } else {
+                            BackupManager.addToQueue(newJob)
+                            val intent = Intent(context, BackupService::class.java)
+                            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                                context.startForegroundService(intent)
+                            } else {
+                                context.startService(intent)
                             }
+                            localStatusMessage = "Queued Download: ${files.size} files"
                             isSelectionMode = false
                             selectedFiles = emptySet()
-                            val totalMB = totalBytes / (1024 * 1024)
-                            statusMessage = "Download complete: $count files ($totalMB MB)"
-                            
-                            withContext(Dispatchers.Main) {
-                                debugLog += "Refreshing file list...\n"
-                                refreshList(sourcePath)
-                            }
                         }
                     }) {
                         Text("Download (${selectedFiles.size})")
@@ -1133,8 +736,14 @@ fun SynologyDownloaderApp(repository: SynologyRepository) {
                         } else if (backupQueue.any { it.label == newJob.label }) {
                              Toast.makeText(context, "Task is already in queue!", Toast.LENGTH_SHORT).show()
                         } else {
-                            backupQueue = backupQueue + newJob
-                            statusMessage = "Queued: ${files.size} files (Queue: ${backupQueue.size})"
+                            BackupManager.addToQueue(newJob)
+                            val intent = Intent(context, BackupService::class.java)
+                            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                                context.startForegroundService(intent)
+                            } else {
+                                context.startService(intent)
+                            }
+                            localStatusMessage = "Queued: ${files.size} files"
                             isSelectionMode = false
                             selectedFiles = emptySet()
                         }
@@ -1178,9 +787,11 @@ fun SynologyDownloaderApp(repository: SynologyRepository) {
                                     
                                     Button(
                                         onClick = { 
-                                            activeBackupJob?.cancel()
-                                            backupQueue = emptyList()
-                                            statusMessage = "Cancelled"
+                                            // Stop Action
+                                            val intent = Intent(context, BackupService::class.java)
+                                            context.stopService(intent)
+                                            BackupManager.clearQueue()
+                                            localStatusMessage = "Cancelled"
                                             refreshStorageTrigger++ // Update storage on stop
                                         },
                                         colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error),
@@ -1213,7 +824,7 @@ fun SynologyDownloaderApp(repository: SynologyRepository) {
                                     if (!isQueueExpanded) {
                                          Button(
                                             onClick = { 
-                                                backupQueue = emptyList() 
+                                                BackupManager.clearQueue()
                                                 refreshStorageTrigger++
                                             },
                                             colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error),
@@ -1243,7 +854,7 @@ fun SynologyDownloaderApp(repository: SynologyRepository) {
                                 Spacer(modifier = Modifier.height(8.dp))
                                 Button(
                                     onClick = { 
-                                        backupQueue = emptyList() 
+                                        BackupManager.clearQueue()
                                         refreshStorageTrigger++
                                     },
                                     modifier = Modifier.fillMaxWidth(),
@@ -1349,6 +960,139 @@ fun SynologyDownloaderApp(repository: SynologyRepository) {
             if (isLoggedIn || debugLog.isNotEmpty()) {
                 
 
+                var showScanDialog by remember { mutableStateOf(false) }
+                var scanResults by remember { mutableStateOf<List<List<String>>?>(null) }
+                var isScanning by remember { mutableStateOf(false) }
+                var isReDownloading by remember { mutableStateOf(false) }
+                
+                if (showScanDialog) {
+                    var checkMetadata by remember { mutableStateOf(true) }
+                    var checkDate by remember { mutableStateOf(false) }
+                    var dateString by remember { mutableStateOf(SimpleDateFormat("yyyy-MM-dd", Locale.getDefault()).format(Date())) }
+                    
+                    AlertDialog(
+                        onDismissRequest = { if(!isScanning) showScanDialog = false },
+                        title = { Text("Scan Local Files") },
+                        text = {
+                            Column {
+                                Row(verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) {
+                                    Checkbox(checked = checkMetadata, onCheckedChange = { checkMetadata = it })
+                                    Text("Missing Metadata (Images)")
+                                }
+                                Row(verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) {
+                                    Checkbox(checked = checkDate, onCheckedChange = { checkDate = it })
+                                    Text("Modified Date:")
+                                }
+                                if (checkDate) {
+                                    OutlinedTextField(
+                                        value = dateString,
+                                        onValueChange = { dateString = it },
+                                        label = { Text("YYYY-MM-DD") },
+                                        singleLine = true
+                                    )
+                                }
+                                if (isScanning) {
+                                    Spacer(modifier = Modifier.height(8.dp))
+                                    LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+                                    Text("Scanning...", modifier = Modifier.padding(top=4.dp))
+                                }
+                            }
+                        },
+                        confirmButton = {
+                            Button(
+                                onClick = {
+                                    isScanning = true
+                                    scope.launch(Dispatchers.IO) {
+                                        val list = scanForIssues(
+                                            onLog = { msg ->
+                                                scope.launch(Dispatchers.Main) {
+                                                    logToUiAndFile(context, msg)
+                                                    appendLog(context, msg)
+                                                }
+                                            },
+                                            checkMetadata,
+                                            if(checkDate) dateString else null
+                                        )
+                                        withContext(Dispatchers.Main) {
+                                            scanResults = list
+                                            isScanning = false
+                                            showScanDialog = false
+                                        }
+                                    }
+                                },
+                                enabled = !isScanning && (checkMetadata || checkDate)
+                            ) { Text("Start Scan") }
+                        },
+                        dismissButton = {
+                            if(!isScanning) Button(onClick = { showScanDialog = false }) { Text("Cancel") }
+                        }
+                    )
+                }
+                
+                val results = scanResults
+                if (results != null) {
+                    AlertDialog(
+                        onDismissRequest = { scanResults = null },
+                        title = { Text("Scan Results (${results.size})") },
+                        text = {
+                            LazyColumn(modifier = Modifier.heightIn(max = 400.dp)) {
+                                items(results) { item ->
+                                    Column(modifier = Modifier.padding(vertical = 4.dp)) {
+                                        Text(item[0].substringAfter("nas/"), fontWeight = FontWeight.Bold, fontSize=12.sp)
+                                        Text(item[1], color = MaterialTheme.colorScheme.error, fontSize=11.sp)
+                                        HorizontalDivider()
+                                    }
+                                }
+                            }
+                        },
+                        confirmButton = {
+                            Button(
+                                onClick = { 
+                                     isReDownloading = true
+                                     scope.launch(Dispatchers.IO) {
+                                         // Trigger re-download
+                                         reDownloadFiles(context, repository, results) { job ->
+                                             scope.launch(Dispatchers.Main) {
+                                                 if (job != null) {
+                                                     if (backupQueue.any { it.label == job.label } || (isBackupRunning && currentBackupLabel == job.label)) {
+                                                         Toast.makeText(context, "Job already in queue", Toast.LENGTH_SHORT).show()
+                                                     } else {
+                                                          
+                                                          BackupManager.addToQueue(job)
+                        val intent = Intent(context, BackupService::class.java)
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                            context.startForegroundService(intent)
+                        } else {
+                            context.startService(intent)
+                        }
+                                                         Toast.makeText(context, "Queued: ${job.label}", Toast.LENGTH_SHORT).show()
+                                                     }
+                                                 } else {
+                                                     Toast.makeText(context, "Failed to create download job", Toast.LENGTH_SHORT).show()
+                                                 }
+                                                 isReDownloading = false
+                                                 scanResults = null
+                                             }
+                                         }
+                                     }
+                                },
+                                enabled = !isReDownloading
+                            ) { 
+                                if (isReDownloading) {
+                                    CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
+                                    Spacer(Modifier.width(8.dp))
+                                    Text("Processing...")
+                                } else {
+                                    Text("Re-Download All")
+                                }
+                            }
+                        },
+                        dismissButton = {
+                            Button(onClick = { scanResults = null }, enabled = !isReDownloading) { Text("Close") }
+                        }
+                    )
+                }
+
                 // Action Buttons Row (Backup, Download, Debug Log)
                 if (!isSelectionMode) {
                      var showDebugLog by remember { mutableStateOf(false) }
@@ -1364,8 +1108,14 @@ fun SynologyDownloaderApp(repository: SynologyRepository) {
                                 } else if (backupQueue.any { it.label == newJob.label }) {
                                      Toast.makeText(context, "Task is already in queue!", Toast.LENGTH_SHORT).show()
                                 } else {
-                                    backupQueue = backupQueue + newJob
-                                    statusMessage = "Queued: Full Backup of $sourcePath"
+                                    BackupManager.addToQueue(newJob)
+                                    val intent = Intent(context, BackupService::class.java)
+                                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                                        context.startForegroundService(intent)
+                                    } else {
+                                        context.startService(intent)
+                                    }
+                                    localStatusMessage = "Queued: Full Backup of $sourcePath"
                                 }
                             }
                         ) {
@@ -1386,28 +1136,71 @@ fun SynologyDownloaderApp(repository: SynologyRepository) {
                             contentPadding = PaddingValues(horizontal = 4.dp),
                             onClick = {
                                 scope.launch {
-                                    statusMessage = "Downloading all..."
+                                    localStatusMessage = "Downloading all..."
                                     var count = 0
                                     withContext(Dispatchers.IO) {
                                          val filesToDownload = fileList.filter { !it.isdir }
                                          filesToDownload.forEach { file ->
-                                            val stream = repository.downloadFile(file.path)
+                                            val stream = repository.downloadFile(file.path) { err ->
+                                                scope.launch(Dispatchers.Main) {
+
+                                                    appendLog(context, "Stream Error ${file.name}: $err")
+                                                }
+                                            }
                                             if (stream != null) {
                                                 val mtime = file.additional?.time?.mtime ?: 0L
                                                 val lastModifiedMs = if (mtime > 0) mtime * 1000L else null
-                                                saveToMediaStore(context, stream, file.name, "SynologyDownloader", 0, lastModifiedMs)
+                                                saveToMediaStore(context, stream, file.name, "SynologyDownloader", 0, lastModifiedMs) { err ->
+                                                    scope.launch(Dispatchers.Main) {
+
+                                                        appendLog(context, "Download failed: $err")
+                                                    }
+                                                }
                                                 count++
                                                 withContext(Dispatchers.Main) {
-                                                        statusMessage = "Downloaded $count files..."
+                                                        localStatusMessage = "Downloaded $count files..."
                                                 }
                                             }
                                         }
                                     }
-                                    statusMessage = "Download completed ($count files)"
+                                    localStatusMessage = "Download completed ($count files)"
                                 }
                             }
                         ) {
                             Text("Download", fontSize = 12.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                        }
+                        
+                        Button(
+                            modifier = Modifier.weight(1f),
+                            contentPadding = PaddingValues(horizontal = 4.dp),
+                            onClick = { 
+                                if (Build.VERSION.SDK_INT >= 30) {
+                                    if (!Environment.isExternalStorageManager()) {
+                                        try {
+                                            val intent = android.content.Intent(android.provider.Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION)
+                                            intent.data = android.net.Uri.parse("package:${context.packageName}")
+                                            context.startActivity(intent)
+                                            Toast.makeText(context, "Please grant 'All files access'", Toast.LENGTH_LONG).show()
+                                        } catch (e: Exception) {
+                                            val intent = android.content.Intent(android.provider.Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION)
+                                            context.startActivity(intent)
+                                        }
+                                    } else {
+                                        showScanDialog = true 
+                                    }
+                                } else {
+                                    if (androidx.core.content.ContextCompat.checkSelfPermission(context, Manifest.permission.READ_EXTERNAL_STORAGE) != android.content.pm.PackageManager.PERMISSION_GRANTED) {
+                                        Toast.makeText(context, "Storage permission required", Toast.LENGTH_LONG).show()
+                                        val intent = android.content.Intent(android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS)
+                                        intent.data = android.net.Uri.parse("package:${context.packageName}")
+                                        context.startActivity(intent)
+                                    } else {
+                                        showScanDialog = true 
+                                    }
+                                }
+                            }
+                        ) {
+                            Text("Scan", fontSize = 12.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
                         }
                     }
                     Spacer(modifier = Modifier.height(8.dp))
@@ -1516,7 +1309,7 @@ fun SynologyDownloaderApp(repository: SynologyRepository) {
                             onClick = {
                                 showLeftoverDialog = false
                                 scope.launch {
-                                    statusMessage = "Deleting leftovers..."
+                                    localStatusMessage = "Deleting leftovers..."
                                     var delCount = 0
                                     var deletedDirs = 0
                                     val parentDirsToCheck = mutableSetOf<String>()
@@ -1543,7 +1336,7 @@ fun SynologyDownloaderApp(repository: SynologyRepository) {
                                             }
                                         }
                                     }
-                                    statusMessage = "Deleted $delCount files and $deletedDirs empty folders."
+                                    localStatusMessage = "Deleted $delCount files and $deletedDirs empty folders."
                                     refreshList(sourcePath)
                                 }
                             },
@@ -1559,319 +1352,198 @@ fun SynologyDownloaderApp(repository: SynologyRepository) {
     }
 }
 
-/**
- * Checks if a file exists in the Downloads/subDir folder using MediaStore.
- * Returns the size of the file if found, or null if not found.
- */
-fun findFileInMediaStore(context: Context, fileName: String, subDir: String): Long? {
-    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-        val projection = arrayOf(MediaStore.MediaColumns._ID, MediaStore.MediaColumns.SIZE)
-        val selection = "${MediaStore.MediaColumns.DISPLAY_NAME} = ? AND ${MediaStore.MediaColumns.RELATIVE_PATH} LIKE ?"
-        val selectionArgs = arrayOf(fileName, "%$subDir%") // Loose match for subdir
+// FileUtils functions moved to com.example.test.utils package
+
+suspend fun reDownloadFiles(
+    context: Context,
+    repository: SynologyRepository,
+    scanResults: List<List<String>>,
+    onJobCreated: (BackupJob?) -> Unit
+) {
+    val nasBaseDir = "/homes/bjkim/google_photo_backup"
+    val filesToDownload = mutableListOf<FileInfo>()
+    
+    scanResults.forEach { item ->
+        val localPath = item[0]
+        val file = File(localPath)
         
-        context.contentResolver.query(
-            MediaStore.Downloads.EXTERNAL_CONTENT_URI,
-            projection,
-            selection,
-            selectionArgs,
-            null
-        )?.use { cursor ->
-            if (cursor.moveToFirst()) {
-                val sizeIndex = cursor.getColumnIndex(MediaStore.MediaColumns.SIZE)
-                return cursor.getLong(sizeIndex)
-            }
-        }
-    } else {
-        // Legacy file check
-        val targetDir = File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS), subDir)
-        val targetFile = File(targetDir, fileName)
-        if (targetFile.exists()) return targetFile.length()
-    }
-    return null
-}
-
-suspend fun saveToMediaStore(context: Context, inputStream: InputStream, fileName: String, subDir: String, expectedSize: Long, lastModified: Long? = null): Boolean {
-    val ext = fileName.substringAfterLast('.', "").lowercase(Locale.ROOT)
-    val isImage = ext in setOf("jpg", "jpeg", "png", "webp", "heic")
-    val isMp4Video = ext in setOf("mp4", "mov")
-    val mimeType = when (ext) {
-        "jpg", "jpeg" -> "image/jpeg"
-        "png" -> "image/png"
-        "webp" -> "image/webp"
-        "heic" -> "image/heic"
-        "mp4" -> "video/mp4"
-        "avi" -> "video/x-msvideo"
-        "mov" -> "video/quicktime"
-        "mkv" -> "video/x-matroska"
-        else -> "application/octet-stream"
-    }
-
-    return withContext(Dispatchers.IO) {
-        try {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                val values = ContentValues().apply {
-                    put(MediaStore.MediaColumns.DISPLAY_NAME, fileName)
-                    put(MediaStore.MediaColumns.MIME_TYPE, mimeType)
-                    put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS + "/$subDir")
-                    put(MediaStore.MediaColumns.IS_PENDING, 1)
-                    if (lastModified != null && lastModified > 0) {
-                        put(MediaStore.MediaColumns.DATE_MODIFIED, lastModified / 1000)
-                        put(MediaStore.MediaColumns.DATE_ADDED, lastModified / 1000)
-                    }
-                }
-                
-                val resolver = context.contentResolver
-                val uri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
-                
-                uri?.let {
-                    resolver.openOutputStream(it)?.use { outputStream ->
-                        inputStream.copyTo(outputStream)
-                    }
-
-                    // Inject EXIF DateTimeOriginal if missing (images only)
-                    if (lastModified != null && lastModified > 0 && isImage) {
-                        try {
-                            resolver.openFileDescriptor(it, "rw")?.use { pfd ->
-                                val exif = ExifInterface(pfd.fileDescriptor)
-                                val existing = exif.getAttribute(ExifInterface.TAG_DATETIME_ORIGINAL)
-                                if (existing.isNullOrEmpty()) {
-                                    val sdf = SimpleDateFormat("yyyy:MM:dd HH:mm:ss", Locale.US)
-                                    exif.setAttribute(ExifInterface.TAG_DATETIME_ORIGINAL, sdf.format(Date(lastModified)))
-                                    exif.setAttribute(ExifInterface.TAG_DATETIME, sdf.format(Date(lastModified)))
-                                    exif.saveAttributes()
-                                }
-                            }
-                        } catch (e: Exception) {
-                            e.printStackTrace()
-                        }
-                    }
-
-                    // Inject MP4 creation_time if missing (mp4/mov videos)
-                    if (lastModified != null && lastModified > 0 && isMp4Video) {
-                        try {
-                            resolver.openFileDescriptor(it, "rw")?.use { pfd ->
-                                val fd = pfd.fileDescriptor
-                                val fis = java.io.FileInputStream(fd)
-                                val channel = fis.channel
-                                val tempFile = File(context.cacheDir, "temp_mp4_meta_${System.currentTimeMillis()}")
-                                tempFile.outputStream().use { os -> fis.copyTo(os) }
-                                channel.close()
-                                fis.close()
-                                
-                                injectMp4CreationDate(tempFile, lastModified)
-                                
-                                // Write back
-                                resolver.openOutputStream(it, "wt")?.use { os ->
-                                    tempFile.inputStream().use { input -> input.copyTo(os) }
-                                }
-                                tempFile.delete()
-                            }
-                        } catch (e: Exception) {
-                            e.printStackTrace()
-                        }
-                    }
-
-                    values.clear()
-                    values.put(MediaStore.MediaColumns.IS_PENDING, 0)
-                    resolver.update(it, values, null, null)
-                    true
-                } ?: false
-            } else {
-                val targetDir = File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS), subDir)
-                if (!targetDir.exists()) targetDir.mkdirs()
-                val targetFile = File(targetDir, fileName)
-                
-                var finalFile = targetFile
-                var v = 1
-                val name = fileName.substringBeforeLast('.')
-                val extPart = fileName.substringAfterLast('.', "")
-                val dot = if (extPart.isNotEmpty()) "." else ""
-                
-                while (finalFile.exists()) {
-                   finalFile = File(targetDir, "${name}_$v$dot$extPart")
-                   v++
-                }
-                
-                FileOutputStream(finalFile).use { outputStream ->
-                    inputStream.copyTo(outputStream)
-                }
-
-                // Set file modified time
-                if (lastModified != null && lastModified > 0) {
-                    finalFile.setLastModified(lastModified)
-                }
-
-                // Inject EXIF DateTimeOriginal if missing (images only)
-                if (lastModified != null && lastModified > 0 && isImage) {
-                    try {
-                        val exif = ExifInterface(finalFile.absolutePath)
-                        val existing = exif.getAttribute(ExifInterface.TAG_DATETIME_ORIGINAL)
-                        if (existing.isNullOrEmpty()) {
-                            val sdf = SimpleDateFormat("yyyy:MM:dd HH:mm:ss", Locale.US)
-                            exif.setAttribute(ExifInterface.TAG_DATETIME_ORIGINAL, sdf.format(Date(lastModified)))
-                            exif.setAttribute(ExifInterface.TAG_DATETIME, sdf.format(Date(lastModified)))
-                            exif.saveAttributes()
-                        }
-                    } catch (e: Exception) {
-                        e.printStackTrace()
-                    }
-                }
-
-                // Inject MP4 creation_time if missing (mp4/mov videos)
-                if (lastModified != null && lastModified > 0 && isMp4Video) {
-                    try {
-                        injectMp4CreationDate(finalFile, lastModified)
-                    } catch (e: Exception) {
-                        e.printStackTrace()
-                    }
-                }
-
-                true
-            }
-        } catch (e: Exception) {
-            e.printStackTrace()
-            false
-        }
-    }
-}
-
-/**
- * Inject creation_time into MP4/MOV file's mvhd atom.
- * MP4 epoch starts 1904-01-01 (offset = 2082844800 seconds from Unix epoch).
- * Only writes if the existing creation_time is 0.
- */
-fun injectMp4CreationDate(file: File, lastModifiedMs: Long) {
-    val MP4_EPOCH_OFFSET = 2082844800L
-    val mp4Time = (lastModifiedMs / 1000) + MP4_EPOCH_OFFSET
-
-    val raf = RandomAccessFile(file, "rw")
-    try {
-        val fileSize = raf.length()
-        var pos = 0L
-
-        // Find moov atom at top level
-        var moovPos = -1L
-        var moovSize = 0L
-        while (pos < fileSize) {
-            raf.seek(pos)
-            if (pos + 8 > fileSize) break
-            val size = raf.readInt().toLong() and 0xFFFFFFFFL
-            val typeBytes = ByteArray(4)
-            raf.readFully(typeBytes)
-            val type = String(typeBytes, Charsets.US_ASCII)
-
-            if (size < 8 && size != 1L) break // invalid
-            val atomSize = if (size == 1L) {
-                if (pos + 16 > fileSize) break
-                raf.readLong() // 64-bit extended size
-            } else {
-                size
-            }
-            if (atomSize <= 0) break
-
-            if (type == "moov") {
-                moovPos = pos
-                moovSize = atomSize
-                break
-            }
-            pos += atomSize
-        }
-
-        if (moovPos < 0) {
-            raf.close()
-            return
-        }
-
-        // Find mvhd atom inside moov
-        val headerSize = 8L // moov header size
-        var innerPos = moovPos + headerSize
-        val moovEnd = moovPos + moovSize
-
-        while (innerPos < moovEnd) {
-            raf.seek(innerPos)
-            if (innerPos + 8 > moovEnd) break
-            val size = raf.readInt().toLong() and 0xFFFFFFFFL
-            val typeBytes = ByteArray(4)
-            raf.readFully(typeBytes)
-            val type = String(typeBytes, Charsets.US_ASCII)
-
-            if (size < 8 && size != 1L) break
-            val atomSize = if (size == 1L) {
-                if (innerPos + 16 > moovEnd) break
-                raf.readLong()
-            } else {
-                size
-            }
-            if (atomSize <= 0) break
-
-            if (type == "mvhd") {
-                // mvhd found: [size(4)][type(4)][version(1)][flags(3)][creation_time][modification_time]...
-                val dataStart = innerPos + 8
-                raf.seek(dataStart)
-                val version = raf.readByte().toInt() and 0xFF
-                raf.skipBytes(3) // flags
-
-                if (version == 0) {
-                    // 4-byte timestamps
-                    val creationTimePos = dataStart + 4
-                    raf.seek(creationTimePos)
-                    val existingCreation = raf.readInt().toLong() and 0xFFFFFFFFL
-                    if (existingCreation == 0L) {
-                        raf.seek(creationTimePos)
-                        raf.writeInt(mp4Time.toInt()) // creation_time
-                        raf.writeInt(mp4Time.toInt()) // modification_time
-                    }
-                } else if (version == 1) {
-                    // 8-byte timestamps
-                    val creationTimePos = dataStart + 4
-                    raf.seek(creationTimePos)
-                    val existingCreation = raf.readLong()
-                    if (existingCreation == 0L) {
-                        raf.seek(creationTimePos)
-                        raf.writeLong(mp4Time) // creation_time
-                        raf.writeLong(mp4Time) // modification_time
-                    }
-                }
-                break
-            }
-            innerPos += atomSize
-        }
-    } finally {
-        raf.close()
-    }
-}
-
-fun appendLog(context: Context, msg: String) {
-    try {
-        val file = File(context.filesDir, "last_session_log.txt")
-        // Rotate log if too big (500KB)
-        if (file.exists() && file.length() > 500 * 1024) {
+        // 1. Delete local file
+        if (file.exists()) {
             file.delete()
         }
-        java.io.FileOutputStream(file, true).use {
-            it.write(("${java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.getDefault()).format(java.util.Date())} : $msg\n").toByteArray())
+        
+        // 2. Construct NAS Path and FileInfo
+        val relativePath = localPath.substringAfter("/nas/")
+        if (relativePath.isNotEmpty() && relativePath != localPath) {
+             val nasPath = "$nasBaseDir/$relativePath"
+             // Helper FileInfo (size/time not critical for generic download logic if we skip size check? 
+             // Logic in BackupJob loop checks 'file.fileSize'. 
+             // Wait, logic uses 'file.additional?.size'. If null, it assumes 0.
+             // If local file deleted, size check (local vs remote) is skipped (targetFile.exists() is false).
+             // So simplistic FileInfo is fine.
+             filesToDownload.add(FileInfo(
+                 path = nasPath,
+                 name = file.name,
+                 isdir = false,
+                 additional = AdditionalInfo(size = 0, time = null)
+             ))
         }
-    } catch (e: Exception) {
-        e.printStackTrace()
+    }
+    
+    if (filesToDownload.isNotEmpty()) {
+        val job = BackupJob.SelectedBackup(filesToDownload, nasBaseDir, moveOnNas = false)
+        onJobCreated(job)
+    } else {
+        onJobCreated(null)
     }
 }
 
-fun readLastLog(context: Context): String {
-    return try {
-        val file = File(context.filesDir, "last_session_log.txt")
-        if (file.exists()) {
-            // Read last 5KB to avoid huge memory usage
-            val length = file.length()
-            val toRead = if (length > 5000) 5000 else length.toInt()
-            val bytes = ByteArray(toRead)
+suspend fun repairMetadata(
+    context: Context,
+    repository: SynologyRepository,
+    scanResults: List<List<String>>,
+    onLog: (String) -> Unit
+): Int {
+    val nasBaseDir = "/homes/bjkim/google_photo_backup"
+    var repairedCount = 0
+    
+    val groups = scanResults.groupBy { 
+        val path = it[0]
+        val substring = path.substringAfter("/nas/", "")
+        if (substring.isNotEmpty() && substring.contains("/")) {
+             substring.substringBeforeLast("/")
+        } else {
+             ""
+        }
+    }
+    
+    groups.forEach { (relativeParent, items) ->
+        val nasParentPath = if (relativeParent.isEmpty()) nasBaseDir else "$nasBaseDir/$relativeParent"
+        onLog("Fetching metadata from: $nasParentPath")
+        
+        val remoteFiles = repository.listFiles(nasParentPath)
+        
+        if (remoteFiles.isEmpty()) {
+            onLog("Failed to list files or empty: $nasParentPath")
+            return@forEach
+        }
+        
+        items.forEach { item ->
+            val localPath = item[0]
+            val fileName = File(localPath).name
+            val remoteFile = remoteFiles.find { it.name == fileName }
             
-            java.io.RandomAccessFile(file, "r").use { raf ->
-                raf.seek(length - toRead)
-                raf.readFully(bytes)
+            if (remoteFile != null) {
+                val mtime = remoteFile.additional?.time?.mtime ?: 0L
+                if (mtime > 0) {
+                     if (repairFile(File(localPath), mtime * 1000L)) {
+                         repairedCount++
+                         onLog("Repaired: $fileName")
+                     } else {
+                         onLog("Failed to repair: $fileName")
+                     }
+                }
+            } else {
+                 onLog("File not found on NAS: $fileName")
             }
-            String(bytes, Charsets.UTF_8)
-        } else ""
-    } catch (e: Exception) {
-        "Error reading log: ${e.message}\n"
-    } 
+        }
+    }
+    return repairedCount
+}
+
+fun repairFile(file: File, time: Long): Boolean {
+    try {
+        if (!file.exists()) return false
+        val successFs = file.setLastModified(time)
+        var successExif = false
+        
+        if (file.extension.lowercase() in setOf("jpg", "jpeg", "heic", "webp", "png")) {
+             try {
+                 val exif = ExifInterface(file.absolutePath)
+                 val sdf = SimpleDateFormat("yyyy:MM:dd HH:mm:ss", Locale.getDefault())
+                 exif.setAttribute(ExifInterface.TAG_DATETIME_ORIGINAL, sdf.format(Date(time)))
+                 exif.saveAttributes()
+                 successExif = true
+             } catch (e: Exception) {
+                 // ignore
+             }
+        }
+        return successFs || successExif
+    } catch(e: Exception) {
+        return false
+    }
+}
+
+suspend fun scanForIssues(onLog: (String) -> Unit, checkMetadata: Boolean, targetDate: String?): List<List<String>> {
+    val downloadDir = android.os.Environment.getExternalStoragePublicDirectory(android.os.Environment.DIRECTORY_DOWNLOADS)
+    val nasDir = File(downloadDir, "nas")
+    val list = mutableListOf<List<String>>()
+    var scannedFileCount = 0
+    
+    onLog("Scan Started: ${nasDir.absolutePath}")
+    
+    if (!nasDir.exists()) {
+        onLog("Scan Skipped: Directory not found")
+        return emptyList()
+    }
+    
+    val rootFiles = nasDir.listFiles()
+    if (rootFiles == null) {
+        onLog("Scan Warning: listFiles() returned null. Check Permissions.")
+    } else {
+        onLog("Root contains ${rootFiles.size} items: ${rootFiles.take(10).joinToString { it.name }}")
+    }
+    
+    val targetTimeRange = if (!targetDate.isNullOrEmpty()) {
+        try {
+            val date = SimpleDateFormat("yyyy-MM-dd", Locale.getDefault()).parse(targetDate)
+            if (date != null) {
+                val cal = Calendar.getInstance()
+                cal.time = date
+                val start = cal.timeInMillis
+                cal.add(Calendar.DAY_OF_YEAR, 1)
+                val end = cal.timeInMillis
+                start to end
+            } else null
+        } catch (e: Exception) { null }
+    } else null
+
+    nasDir.walk()
+        .onFail { f, e ->
+            onLog("Walk Error: ${f.absolutePath} - ${e.message}")
+        }
+        .onEnter {
+            onLog("Scanning Dir: ${it.absolutePath}")
+            true
+        }
+        .filter { it.isFile }
+        .forEach { file ->
+            scannedFileCount++
+            val reasons = mutableListOf<String>()
+            val ext = file.extension.lowercase()
+            
+            if (checkMetadata && ext in setOf("jpg", "jpeg", "heic", "webp", "png")) {
+                 try {
+                    val exif = ExifInterface(file.absolutePath)
+                    val date = exif.getAttribute(ExifInterface.TAG_DATETIME_ORIGINAL)
+                    if (date.isNullOrEmpty()) {
+                        reasons.add("No EXIF Date")
+                    }
+                 } catch (e: Exception) {
+                     // ignore
+                 }
+            }
+            
+            if (targetTimeRange != null) {
+                if (file.lastModified() in targetTimeRange.first until targetTimeRange.second) {
+                    reasons.add("Modified on $targetDate")
+                }
+            }
+            
+            if (reasons.isNotEmpty()) {
+                list.add(listOf(file.absolutePath, reasons.joinToString(", ")))
+            }
+        }
+    onLog("Scan Finished. Scanned $scannedFileCount files. Found ${list.size} issues.")
+    return list
 }

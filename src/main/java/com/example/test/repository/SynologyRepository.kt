@@ -56,6 +56,9 @@ class SynologyRepository {
             OkHttpClient.Builder()
                 .sslSocketFactory(sslSocketFactory, trustAllCerts[0] as javax.net.ssl.X509TrustManager)
                 .hostnameVerifier { _, _ -> true }
+                .connectTimeout(60, java.util.concurrent.TimeUnit.SECONDS)
+                .readTimeout(60, java.util.concurrent.TimeUnit.SECONDS)
+                .writeTimeout(60, java.util.concurrent.TimeUnit.SECONDS)
                 .build()
         } catch (e: Exception) {
             throw RuntimeException(e)
@@ -274,21 +277,28 @@ class SynologyRepository {
         }
     }
 
-    suspend fun downloadFile(path: String): InputStream? {
+    suspend fun downloadFile(path: String, onError: (String) -> Unit = {}): InputStream? {
         return try {
-            if (sid == null) return null
+            if (sid == null) {
+                onError("Not logged in (SID is null)")
+                return null
+            }
             // Construct download URL manually
             val encodePath = java.net.URLEncoder.encode(path, "UTF-8")
             val downloadUrl = "${baseUrl}webapi/entry.cgi?api=SYNO.FileStation.Download&version=2&method=download&path=$encodePath&mode=open&_sid=$sid"
             
             val response = api?.downloadFile(downloadUrl)
             if (response?.isSuccessful == true) {
-                response.body()?.byteStream()
+                val input = response.body()?.byteStream()
+                if (input == null) onError("Response body is empty")
+                input
             } else {
+                onError("HTTP ${response?.code()} ${response?.message()}")
                 null
             }
         } catch (e: Exception) {
             e.printStackTrace()
+            onError("Exception: ${e.message}")
             null
         }
     }
