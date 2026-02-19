@@ -1446,10 +1446,10 @@ suspend fun reDownloadFiles(
         val localPath = item[0]
         val file = File(localPath)
         
-        // 1. Delete local file
-        if (file.exists()) {
-            file.delete()
-        }
+        // 1. Delete local file - SKIPPED FOR ATOMIC REPLACE
+        // if (file.exists()) {
+        //     file.delete()
+        // }
         
         // 2. Construct NAS Path and FileInfo
         val relativePath = localPath.substringAfter("/nas/")

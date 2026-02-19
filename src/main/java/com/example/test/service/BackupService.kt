@@ -266,7 +266,7 @@ class BackupService : Service() {
                             
                             BackupManager.statusMessage.value = "Saving ${index+1}/${realFilesToDownload.size} ($progressStr$etaStr): ${file.name}"
                             
-                            success = saveToMediaStore(context, stream, file.name, localSubDir, remoteSize, lastModifiedMs) { msg ->
+                            success = saveToMediaStore(context, stream, file.name, localSubDir, remoteSize, lastModifiedMs, atomicReplace = true) { msg ->
                                 CoroutineScope(Dispatchers.Main).launch {
                                     BackupManager.appendLog(msg)
                                 }
@@ -344,12 +344,14 @@ class BackupService : Service() {
                     }
              }
              
-             // Cleanup empty dirs
+             // Cleanup empty dirs and junk files
+             BackupManager.appendLog("Checking for empty directories and junk files...")
+             val dirsToCheck = mutableSetOf<String>()
+
              if (job is BackupJob.RecursiveBackup) {
-                 BackupManager.appendLog("Checking for empty directories...")
-                 val dirsToCheck = mutableListOf<String>()
                  val dirQueue = ArrayDeque<String>()
                  dirQueue.add(job.sourcePath)
+                 dirsToCheck.add(job.sourcePath)
                  while (dirQueue.isNotEmpty()) {
                      val dir = dirQueue.removeFirst()
                      val items = repository.listFiles(dir)
@@ -360,16 +362,47 @@ class BackupService : Service() {
                          }
                      }
                  }
-                 var deletedDirs = 0
-                 for (dir in dirsToCheck.reversed()) {
-                     val contents = repository.listFiles(dir)
-                     if (contents.isEmpty()) {
-                         val result = repository.deleteFile(dir)
-                         if (result == "Success") deletedDirs++
+             } else if (job is BackupJob.SelectedBackup) {
+                 for (file in job.files) {
+                     var currentPath = file.path.substringBeforeLast('/')
+                     while (currentPath.isNotEmpty() && currentPath.length >= job.sourcePath.length) {
+                         if (currentPath.startsWith(job.sourcePath)) {
+                             dirsToCheck.add(currentPath)
+                         }
+                         val nextPath = currentPath.substringBeforeLast('/')
+                         if (nextPath == currentPath) break
+                         currentPath = nextPath
                      }
                  }
-                 if (deletedDirs > 0) BackupManager.appendLog("Cleaned up $deletedDirs empty directories")
              }
+
+             var deletedDirs = 0
+             var deletedJunkFiles = 0
+             val sortedDirs = dirsToCheck.sortedByDescending { it.length }
+
+             for (dir in sortedDirs) {
+                 val contents = repository.listFiles(dir)
+                 
+                 // Auto-delete junk files
+                 val junkFiles = contents.filter { !it.isdir && (it.name.equals("Thumbs.db", ignoreCase = true) || it.name.substringAfterLast('.', "").lowercase() == "nfo") }
+                 for (junk in junkFiles) {
+                     val result = repository.deleteFile(junk.path)
+                     if (result == "Success") deletedJunkFiles++
+                 }
+                 
+                 // Check if empty after deleting junk files
+                 val remainingContents = contents.filter { it.isdir || !junkFiles.contains(it) }
+                 
+                 val isEffectivelyEmpty = remainingContents.isEmpty() || remainingContents.all { it.isdir && it.name == "@eaDir" }
+                 
+                 if (isEffectivelyEmpty) {
+                     val result = repository.deleteFile(dir)
+                     if (result == "Success") deletedDirs++
+                 }
+             }
+
+             if (deletedJunkFiles > 0) BackupManager.appendLog("Cleaned up $deletedJunkFiles junk files (.nfo, Thumbs.db)")
+             if (deletedDirs > 0) BackupManager.appendLog("Cleaned up $deletedDirs empty directories")
              
              BackupManager.appendLog("Job Done. Processed $filesDone files.")
              
