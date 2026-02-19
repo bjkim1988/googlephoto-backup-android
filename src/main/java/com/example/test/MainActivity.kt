@@ -225,7 +225,9 @@ fun SynologyDownloaderApp(repository: SynologyRepository) {
             localStatusMessage = "Listing files..."
             withContext(Dispatchers.IO) {
                 try {
-                    val files = repository.listFiles(path)
+                    val files = repository.listFiles(path).filter { 
+                        !it.name.equals("folder.jpg", ignoreCase = true) 
+                    }
                     withContext(Dispatchers.Main) {
                         fileList = files
                         localStatusMessage = "Files listed: ${files.size}"
@@ -973,6 +975,7 @@ fun SynologyDownloaderApp(repository: SynologyRepository) {
                 var isReDownloading by remember { mutableStateOf(false) }
                 
                 if (showScanDialog) {
+                    var checkAllFiles by remember { mutableStateOf(false) }
                     var checkMetadata by remember { mutableStateOf(true) }
                     var checkDate by remember { mutableStateOf(false) }
                     var dateString by remember { mutableStateOf(SimpleDateFormat("yyyy-MM-dd", Locale.getDefault()).format(Date())) }
@@ -998,6 +1001,10 @@ fun SynologyDownloaderApp(repository: SynologyRepository) {
                                         singleLine = true
                                     )
                                 }
+                                Row(verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) {
+                                    Checkbox(checked = checkAllFiles, onCheckedChange = { checkAllFiles = it })
+                                    Text("List All Files")
+                                }
                                 if (isScanning) {
                                     Spacer(modifier = Modifier.height(8.dp))
                                     LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
@@ -1018,7 +1025,8 @@ fun SynologyDownloaderApp(repository: SynologyRepository) {
                                                 }
                                             },
                                             checkMetadata,
-                                            if(checkDate) dateString else null
+                                            if(checkDate) dateString else null,
+                                            checkAllFiles
                                         )
                                         withContext(Dispatchers.Main) {
                                             scanResults = list
@@ -1027,7 +1035,7 @@ fun SynologyDownloaderApp(repository: SynologyRepository) {
                                         }
                                     }
                                 },
-                                enabled = !isScanning && (checkMetadata || checkDate)
+                                enabled = !isScanning && (checkMetadata || checkDate || checkAllFiles)
                             ) { Text("Start Scan") }
                         },
                         dismissButton = {
@@ -1038,27 +1046,69 @@ fun SynologyDownloaderApp(repository: SynologyRepository) {
                 
                 val results = scanResults
                 if (results != null) {
+                    // Selection state for scan results
+                    val selectedScanItems = remember { mutableStateListOf<List<String>>() }
+                    // Initialize with all selected or none? User usually wants to pick. Let's start with empty or logic? 
+                    // Usually "checked by default" if issues found?
+                    // Let's start with empty to be safe, or maybe none.
+                    // Actually, let's start with NONE so user picks what to rename.
+                    
                     AlertDialog(
                         onDismissRequest = { scanResults = null },
-                        title = { Text("Scan Results (${results.size})") },
+                        title = { 
+                            Row(verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) {
+                                Text("Scan Results (${results.size})", modifier = Modifier.weight(1f))
+                                TextButton(onClick = {
+                                    if (selectedScanItems.size == results.size) {
+                                        selectedScanItems.clear()
+                                    } else {
+                                        selectedScanItems.clear()
+                                        selectedScanItems.addAll(results)
+                                    }
+                                }) {
+                                    Text(if (selectedScanItems.size == results.size) "Deselect All" else "Select All")
+                                }
+                            }
+                        },
                         text = {
                             LazyColumn(modifier = Modifier.heightIn(max = 400.dp)) {
                                 items(results) { item ->
-                                    Column(modifier = Modifier.padding(vertical = 4.dp)) {
-                                        Text(item[0].substringAfter("nas/"), fontWeight = FontWeight.Bold, fontSize=12.sp)
-                                        Text(item[1], color = MaterialTheme.colorScheme.error, fontSize=11.sp)
-                                        HorizontalDivider()
+                                    val isSelected = selectedScanItems.contains(item)
+                                    Row(
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .clickable {
+                                                if (isSelected) selectedScanItems.remove(item) else selectedScanItems.add(item)
+                                            }
+                                            .padding(vertical = 4.dp),
+                                        verticalAlignment = androidx.compose.ui.Alignment.CenterVertically
+                                    ) {
+                                        Checkbox(
+                                            checked = isSelected,
+                                            onCheckedChange = { checked ->
+                                                if (checked) selectedScanItems.add(item) else selectedScanItems.remove(item)
+                                            }
+                                        )
+                                        Column(modifier = Modifier.padding(start = 8.dp).weight(1f)) {
+                                            Text(item[0].substringAfter("nas/"), fontWeight = FontWeight.Bold, fontSize = 12.sp)
+                                            Text(item[1], color = MaterialTheme.colorScheme.error, fontSize = 11.sp)
+                                        }
                                     }
+                                    HorizontalDivider()
                                 }
                             }
                         },
                         confirmButton = {
                             Button(
                                 onClick = { 
+                                     if (selectedScanItems.isEmpty()) {
+                                         Toast.makeText(context, "No items selected", Toast.LENGTH_SHORT).show()
+                                         return@Button
+                                     }
                                      isReDownloading = true
                                      scope.launch(Dispatchers.IO) {
-                                         // Trigger re-download
-                                         reDownloadFiles(context, repository, results) { job ->
+                                         // Trigger re-download with filtered list
+                                         reDownloadFiles(context, repository, selectedScanItems.toList()) { job ->
                                              scope.launch(Dispatchers.Main) {
                                                  if (job != null) {
                                                      if (backupQueue.any { it.label == job.label } || (isBackupRunning && currentBackupLabel == job.label)) {
@@ -1078,7 +1128,10 @@ fun SynologyDownloaderApp(repository: SynologyRepository) {
                                                      Toast.makeText(context, "Failed to create download job", Toast.LENGTH_SHORT).show()
                                                  }
                                                  isReDownloading = false
-                                                 scanResults = null
+                                                 // Don't close dialog automatically, user might want to do more?
+                                                 // Or maybe clear selection?
+                                                 // Let's keep dialog open but clear selection?
+                                                 // scanResults = null // Close dialog
                                              }
                                          }
                                      }
@@ -1090,12 +1143,40 @@ fun SynologyDownloaderApp(repository: SynologyRepository) {
                                     Spacer(Modifier.width(8.dp))
                                     Text("Processing...")
                                 } else {
-                                    Text("Re-Download All")
+                                    Text("Re-Download (${selectedScanItems.size})")
                                 }
                             }
                         },
+
                         dismissButton = {
-                            Button(onClick = { scanResults = null }, enabled = !isReDownloading) { Text("Close") }
+                            Row {
+                                Button(
+                                    onClick = {
+                                        if (selectedScanItems.isEmpty()) {
+                                            Toast.makeText(context, "No items selected", Toast.LENGTH_SHORT).show()
+                                            return@Button
+                                        }
+                                        scope.launch(Dispatchers.IO) {
+                                            val count = renameScannedFiles(selectedScanItems.toList()) { msg ->
+                                                scope.launch(Dispatchers.Main) { logToUiAndFile(context, msg) }
+                                            }
+                                            withContext(Dispatchers.Main) {
+                                                Toast.makeText(context, "Renamed $count files", Toast.LENGTH_SHORT).show()
+                                                // Update the list? We need to refresh scan results or remove renamed items.
+                                                // For now, let's close the dialog to force re-scan or just keep it open (items will now point to non-existent files though).
+                                                // Safest is to close or refresh. Let's close for now.
+                                                scanResults = null
+                                            }
+                                        }
+                                    },
+                                    enabled = !isReDownloading,
+                                    colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.secondary)
+                                ) {
+                                    Text("Rename (${selectedScanItems.size})")
+                                }
+                                Spacer(modifier = Modifier.width(8.dp))
+                                Button(onClick = { scanResults = null }, enabled = !isReDownloading) { Text("Close") }
+                            }
                         }
                     )
                 }
@@ -1472,7 +1553,7 @@ fun repairFile(file: File, time: Long): Boolean {
     }
 }
 
-suspend fun scanForIssues(onLog: (String) -> Unit, checkMetadata: Boolean, targetDate: String?): List<List<String>> {
+suspend fun scanForIssues(onLog: (String) -> Unit, checkMetadata: Boolean, targetDate: String?, includeAllFiles: Boolean = false): List<List<String>> {
     val downloadDir = android.os.Environment.getExternalStoragePublicDirectory(android.os.Environment.DIRECTORY_DOWNLOADS)
     val nasDir = File(downloadDir, "nas")
     val list = mutableListOf<List<String>>()
@@ -1514,11 +1595,15 @@ suspend fun scanForIssues(onLog: (String) -> Unit, checkMetadata: Boolean, targe
             onLog("Scanning Dir: ${it.absolutePath}")
             true
         }
-        .filter { it.isFile }
+        .filter { it.isFile && !it.name.equals("folder.jpg", ignoreCase = true) }
         .forEach { file ->
             scannedFileCount++
             val reasons = mutableListOf<String>()
             val ext = file.extension.lowercase()
+            
+            if (includeAllFiles) {
+                reasons.add("Found")
+            }
             
             if (checkMetadata && ext in setOf("jpg", "jpeg", "heic", "webp", "png")) {
                  try {
@@ -1544,4 +1629,40 @@ suspend fun scanForIssues(onLog: (String) -> Unit, checkMetadata: Boolean, targe
         }
     onLog("Scan Finished. Scanned $scannedFileCount files. Found ${list.size} issues.")
     return list
+}
+
+fun renameScannedFiles(scanResults: List<List<String>>, onLog: (String) -> Unit): Int {
+    var renamedCount = 0
+    // scanResults is list of [absolutePath, reason]
+    scanResults.forEach { item ->
+        try {
+            val originalPath = item[0]
+            val file = File(originalPath)
+            if (file.exists()) {
+                val parentDir = file.parentFile
+                val name = file.name
+                val extension = file.extension
+                val nameWithoutExtension = file.nameWithoutExtension
+                
+                val newName = if (extension.isNotEmpty()) {
+                    "${nameWithoutExtension}_rename.$extension"
+                } else {
+                    "${name}_rename"
+                }
+                
+                val newFile = File(parentDir, newName)
+                if (file.renameTo(newFile)) {
+                    renamedCount++
+                    onLog("Renamed: ${file.name} -> ${newFile.name}")
+                } else {
+                    onLog("Failed to rename: ${file.name}")
+                }
+            } else {
+                onLog("File not found: $originalPath")
+            }
+        } catch (e: Exception) {
+            onLog("Error renaming ${item[0]}: ${e.message}")
+        }
+    }
+    return renamedCount
 }

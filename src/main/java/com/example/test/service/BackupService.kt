@@ -126,6 +126,7 @@ class BackupService : Service() {
             val videoExtensions = setOf("mp4", "mov", "avi", "mkv", "wmv", "flv", "webm", "m4v", "3gp", "mpeg", "mpg")
 
             val filesToDownload = candidateFiles.filter { file ->
+                if (file.name.equals("folder.jpg", ignoreCase = true)) return@filter false
                 val ext = file.name.substringAfterLast('.', "").lowercase()
                 ext in imageExtensions || ext in videoExtensions
             }
