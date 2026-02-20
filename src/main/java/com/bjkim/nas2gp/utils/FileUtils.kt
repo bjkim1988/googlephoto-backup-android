@@ -1,4 +1,4 @@
-package com.example.test.utils
+﻿package com.bjkim.nas2gp.utils
 
 import android.content.ContentValues
 import android.content.Context
@@ -164,10 +164,10 @@ suspend fun saveToMediaStore(context: Context, inputStream: InputStream, fileNam
                     onLog("Atomic Replace: Starting...")
                     val tmpFile = File(targetDir, "${fileName}_tmp")
                     val bkFile = File(targetDir, "${fileName.substringBeforeLast('.')}_bk.${fileName.substringAfterLast('.')}") // actually user said "_bk", usually appended to name? "existing file to _bk".
-                    // User: "기존 파일을 '_bk'로 변경". implicit: append _bk to filename? or extension? 
+                    // User: "湲곗〈 ?뚯씪??'_bk'濡?蹂寃?. implicit: append _bk to filename? or extension? 
                     // Usually "image.jpg" -> "image_bk.jpg" or "image.jpg_bk"? 
                     // Let's use "image_bk.jpg" (insert before extension) per common practice unless specific.
-                    // User said: "기존 파일을 '_bk'로 변경" -> likely "filename_bk.ext"
+                    // User said: "湲곗〈 ?뚯씪??'_bk'濡?蹂寃? -> likely "filename_bk.ext"
                     val nameWithoutExt = fileName.substringBeforeLast('.')
                     val extOrEmpty = if (fileName.contains('.')) ".${fileName.substringAfterLast('.')}" else ""
                     val backupName = "${nameWithoutExt}_bk$extOrEmpty"
@@ -397,3 +397,4 @@ fun readLastLog(context: Context): String {
         "Error reading log: ${e.message}\n"
     } 
 }
+

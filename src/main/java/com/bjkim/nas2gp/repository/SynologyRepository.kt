@@ -1,10 +1,10 @@
-package com.example.test.repository
+﻿package com.bjkim.nas2gp.repository
 
 import android.util.Log
-import com.example.test.network.AuthResponse
-import com.example.test.network.FileInfo
-import com.example.test.network.ListResponse
-import com.example.test.network.SynologyApi
+import com.bjkim.nas2gp.network.AuthResponse
+import com.bjkim.nas2gp.network.FileInfo
+import com.bjkim.nas2gp.network.ListResponse
+import com.bjkim.nas2gp.network.SynologyApi
 import okhttp3.OkHttpClient
 import okhttp3.ResponseBody
 import okhttp3.logging.HttpLoggingInterceptor
@@ -419,3 +419,4 @@ class SynologyRepository {
         jobs.mapNotNull { it.await() }
     }
 }
+

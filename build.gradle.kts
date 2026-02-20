@@ -1,15 +1,16 @@
-plugins {
+﻿plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.kotlin.android)
     alias(libs.plugins.kotlin.compose)
+    id("kotlin-kapt")
 }
 
 android {
-    namespace = "com.example.test"
+    namespace = "com.bjkim.nas2gp"
     compileSdk = 35
 
     defaultConfig {
-        applicationId = "com.example.test"
+        applicationId = "com.bjkim.nas2gp"
         minSdk = 29
         targetSdk = 35
         versionCode = 1
@@ -62,4 +63,10 @@ dependencies {
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3")
     implementation("androidx.compose.material:material-icons-extended")
     implementation("androidx.security:security-crypto:1.1.0-alpha06")
+    implementation("com.google.android.gms:play-services-auth:21.0.0")
+    
+    val room_version = "2.6.1"
+    implementation("androidx.room:room-runtime:$room_version")
+    implementation("androidx.room:room-ktx:$room_version")
+    kapt("androidx.room:room-compiler:$room_version")
 }

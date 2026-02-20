@@ -1,4 +1,4 @@
-package com.example.test
+﻿package com.bjkim.nas2gp
 
 import android.Manifest
 import android.content.ContentValues
@@ -44,10 +44,10 @@ import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.TextUnit
-import com.example.test.network.FileInfo
-import com.example.test.network.AdditionalInfo
-import com.example.test.repository.SynologyRepository
-import com.example.test.ui.theme.TestTheme
+import com.bjkim.nas2gp.network.FileInfo
+import com.bjkim.nas2gp.network.AdditionalInfo
+import com.bjkim.nas2gp.repository.SynologyRepository
+import com.bjkim.nas2gp.ui.theme.TestTheme
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.Dispatchers
@@ -58,6 +58,13 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.withContext
 import java.io.File
 import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.TextButton
+import com.bjkim.nas2gp.auth.GoogleSignInHelper
+import com.bjkim.nas2gp.service.GooglePhotosUploadManager
+import com.bjkim.nas2gp.service.GooglePhotosUploadService
+import com.google.android.gms.auth.api.signin.GoogleSignIn
+import com.google.android.gms.auth.api.signin.GoogleSignInAccount
+import com.google.android.gms.common.api.ApiException
 import androidx.compose.material3.TextButton
 import androidx.compose.foundation.layout.heightIn
 import java.io.FileOutputStream
@@ -73,15 +80,16 @@ import java.util.Date
 import java.util.Locale
 import java.util.Calendar
 import android.content.Intent
-import com.example.test.model.BackupJob
-import com.example.test.service.BackupManager
-import com.example.test.service.BackupService
-import com.example.test.utils.appendLog
-import com.example.test.utils.readLastLog
-import com.example.test.utils.findFileInMediaStore
-import com.example.test.utils.saveToMediaStore
+import com.bjkim.nas2gp.model.BackupJob
+import com.bjkim.nas2gp.service.BackupManager
+import com.bjkim.nas2gp.service.BackupService
+import com.bjkim.nas2gp.utils.appendLog
+import com.bjkim.nas2gp.utils.readLastLog
+import com.bjkim.nas2gp.utils.findFileInMediaStore
+import com.bjkim.nas2gp.utils.saveToMediaStore
 
 fun logToUiAndFile(context: Context, msg: String) {
+    android.util.Log.d("SynologyDownloader", msg)
     BackupManager.appendLog(msg)
     appendLog(context, msg)
 }
@@ -132,6 +140,19 @@ fun SynologyDownloaderApp(repository: SynologyRepository) {
 
     var fileList by remember { mutableStateOf<List<FileInfo>>(emptyList()) }
 
+    // Launcher for Android 10 storage permissions
+    val storagePermissionLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions()
+    ) { permissions ->
+        val readGranted = permissions[Manifest.permission.READ_EXTERNAL_STORAGE] == true
+        val writeGranted = permissions[Manifest.permission.WRITE_EXTERNAL_STORAGE] == true
+        if (readGranted) {
+            logToUiAndFile(context, "Storage permissions granted! You can now start the upload.")
+        } else {
+            logToUiAndFile(context, "Storage permission was denied.")
+        }
+    }
+
     var isLoggedIn by remember { mutableStateOf(false) }
     
     var isSelectionMode by remember { mutableStateOf(false) }
@@ -150,22 +171,22 @@ fun SynologyDownloaderApp(repository: SynologyRepository) {
     var isScanning by remember { mutableStateOf(false) }
     
     // Backup queue (Managed by BackupManager)
-    val backupQueue by com.example.test.service.BackupManager.queue.collectAsState()
-    val isBackupRunning by com.example.test.service.BackupManager.isBackupRunning.collectAsState()
+    val backupQueue by com.bjkim.nas2gp.service.BackupManager.queue.collectAsState()
+    val isBackupRunning by com.bjkim.nas2gp.service.BackupManager.isBackupRunning.collectAsState()
     // Local status for non-backup ops, or shared?
     // Let's keep local statusMessage for Login/Listing, but observe BackupManager for updates?
     // Actually, let's mix them.
     var localStatusMessage by remember { mutableStateOf("Ready") }
-    val serviceStatusMessage by com.example.test.service.BackupManager.statusMessage.collectAsState()
+    val serviceStatusMessage by com.bjkim.nas2gp.service.BackupManager.statusMessage.collectAsState()
     
     // Derived status: if backup running, show service status, else local
     val statusMessage = if (isBackupRunning) serviceStatusMessage else localStatusMessage
     
     // Debug Log: Service log + Local log?
     // Let's use BackupManager.debugLog as the source of truth if possible, or just append local logs to it.
-    val debugLog by com.example.test.service.BackupManager.debugLog.collectAsState()
+    val debugLog by com.bjkim.nas2gp.service.BackupManager.debugLog.collectAsState()
     
-    val activeJob by com.example.test.service.BackupManager.activeJob.collectAsState()
+    val activeJob by com.bjkim.nas2gp.service.BackupManager.activeJob.collectAsState()
     val currentBackupLabel = activeJob?.label ?: "" 
     // Actually BackupManager doesn't expose current label directly except via status?
     // We can filter queue to guess.
@@ -174,9 +195,45 @@ fun SynologyDownloaderApp(repository: SynologyRepository) {
     var activeBackupJob by remember { mutableStateOf<Job?>(null) }
     
     LaunchedEffect(Unit) {
-        com.example.test.service.BackupManager.repository = repository
+        com.bjkim.nas2gp.service.BackupManager.repository = repository
     }
     
+    // Google Photos State
+    var googleAccount by remember { mutableStateOf<GoogleSignInAccount?>(null) }
+    var googleSignInError by remember { mutableStateOf<String?>(null) }
+    val isGoogleUploading by GooglePhotosUploadManager.isUploading.collectAsState()
+    val googleUploadProgress by GooglePhotosUploadManager.progress.collectAsState()
+    val googleUploadStatus by GooglePhotosUploadManager.statusMessage.collectAsState()
+    
+    val googleSignInLauncher = rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
+        logToUiAndFile(context, "Google Sign-In result code: ${result.resultCode}")
+        if (result.resultCode == Activity.RESULT_OK) {
+            val task = GoogleSignIn.getSignedInAccountFromIntent(result.data)
+            try {
+                val account = task.getResult(ApiException::class.java)
+                googleAccount = account
+                logToUiAndFile(context, "Google Sign-In Success: ${account.email}")
+            } catch (e: ApiException) {
+                val errorMsg = "Google Sign-In failed: ${e.statusCode} ${e.message}"
+                logToUiAndFile(context, errorMsg)
+                googleSignInError = errorMsg
+            }
+        } else {
+            val task = GoogleSignIn.getSignedInAccountFromIntent(result.data)
+            try {
+                task.getResult(ApiException::class.java) // Just to trigger the exception extraction
+            } catch(e: ApiException) {
+                val errorMsg = "Google Sign-In canceled/error (code ${result.resultCode}): ${e.statusCode} ${e.message}"
+                logToUiAndFile(context, errorMsg)
+                googleSignInError = errorMsg
+            }
+        }
+    }
+
+    LaunchedEffect(Unit) {
+        googleAccount = GoogleSignIn.getLastSignedInAccount(context)
+    }
+
     // Leftover files handling
     var leftoverFiles by remember { mutableStateOf<List<FileInfo>>(emptyList()) }
     var showLeftoverDialog by remember { mutableStateOf(false) }
@@ -266,7 +323,11 @@ fun SynologyDownloaderApp(repository: SynologyRepository) {
                     value = host,
                     onValueChange = { host = it },
                     label = { Text("Host URL (e.g. https://192.168.0.x:5001)") },
-                    modifier = Modifier.fillMaxWidth()
+                    modifier = Modifier.fillMaxWidth(),
+                    keyboardOptions = KeyboardOptions(imeAction = androidx.compose.ui.text.input.ImeAction.Next),
+                    keyboardActions = androidx.compose.foundation.text.KeyboardActions(
+                        onNext = { if (host.isNotBlank()) loginStep = 2 }
+                    )
                 )
                 
                 // Find NAS button
@@ -362,7 +423,11 @@ fun SynologyDownloaderApp(repository: SynologyRepository) {
                     value = username,
                     onValueChange = { username = it },
                     label = { Text("Username") },
-                    modifier = Modifier.fillMaxWidth()
+                    modifier = Modifier.fillMaxWidth(),
+                    keyboardOptions = KeyboardOptions(imeAction = androidx.compose.ui.text.input.ImeAction.Next),
+                    keyboardActions = androidx.compose.foundation.text.KeyboardActions(
+                        onNext = { if (username.isNotBlank()) loginStep = 3 }
+                    )
                 )
                 
                 Spacer(modifier = Modifier.height(16.dp))
@@ -402,16 +467,7 @@ fun SynologyDownloaderApp(repository: SynologyRepository) {
                 }
                 
                 Spacer(modifier = Modifier.height(8.dp))
-                OutlinedTextField(
-                    value = password, 
-                    onValueChange = { password = it }, 
-                    label = { Text("Password") }, 
-                    modifier = Modifier.fillMaxWidth(),
-                    visualTransformation = PasswordVisualTransformation()
-                )
-                
-                Spacer(modifier = Modifier.height(16.dp))
-                Button(onClick = {
+                val performLogin = {
                     scope.launch {
                         localStatusMessage = "Logging in..."
                         logToUiAndFile(context, "Attempting login to $host with user $username...")
@@ -462,7 +518,22 @@ fun SynologyDownloaderApp(repository: SynologyRepository) {
                             }
                         }
                     }
-                }, modifier = Modifier.fillMaxWidth()) {
+                }
+
+                OutlinedTextField(
+                    value = password, 
+                    onValueChange = { password = it }, 
+                    label = { Text("Password") }, 
+                    modifier = Modifier.fillMaxWidth(),
+                    visualTransformation = PasswordVisualTransformation(),
+                    keyboardOptions = KeyboardOptions(imeAction = androidx.compose.ui.text.input.ImeAction.Done),
+                    keyboardActions = androidx.compose.foundation.text.KeyboardActions(
+                        onDone = { performLogin() }
+                    )
+                )
+                
+                Spacer(modifier = Modifier.height(16.dp))
+                Button(onClick = { performLogin() }, modifier = Modifier.fillMaxWidth()) {
                     Text("Login")
                 }
             }
@@ -480,25 +551,7 @@ fun SynologyDownloaderApp(repository: SynologyRepository) {
                 }
                 
                 Spacer(modifier = Modifier.height(16.dp))
-                OutlinedTextField(
-                    value = otpCode,
-                    onValueChange = { otpCode = it },
-                    label = { Text("OTP Code (6 digits)") },
-                    modifier = Modifier.fillMaxWidth(),
-                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number)
-                )
-                
-                Spacer(modifier = Modifier.height(8.dp))
-                Row(verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) {
-                    Checkbox(
-                        checked = rememberDevice,
-                        onCheckedChange = { rememberDevice = it }
-                    )
-                    Text("Don't ask again on this device")
-                }
-                
-                Spacer(modifier = Modifier.height(16.dp))
-                Button(onClick = {
+                val performOtp = {
                     scope.launch {
                         localStatusMessage = "Verifying OTP..."
                         withContext(Dispatchers.IO) {
@@ -545,7 +598,33 @@ fun SynologyDownloaderApp(repository: SynologyRepository) {
                             }
                         }
                     }
-                }, modifier = Modifier.fillMaxWidth()) {
+                }
+
+                OutlinedTextField(
+                    value = otpCode,
+                    onValueChange = { otpCode = it },
+                    label = { Text("OTP Code (6 digits)") },
+                    modifier = Modifier.fillMaxWidth(),
+                    keyboardOptions = KeyboardOptions(
+                        keyboardType = KeyboardType.Number,
+                        imeAction = androidx.compose.ui.text.input.ImeAction.Done
+                    ),
+                    keyboardActions = androidx.compose.foundation.text.KeyboardActions(
+                        onDone = { performOtp() }
+                    )
+                )
+                
+                Spacer(modifier = Modifier.height(8.dp))
+                Row(verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) {
+                    Checkbox(
+                        checked = rememberDevice,
+                        onCheckedChange = { rememberDevice = it }
+                    )
+                    Text("Don't ask again on this device")
+                }
+                
+                Spacer(modifier = Modifier.height(16.dp))
+                Button(onClick = { performOtp() }, modifier = Modifier.fillMaxWidth()) {
                     Text("Verify")
                 }
                 
@@ -1281,6 +1360,117 @@ fun SynologyDownloaderApp(repository: SynologyRepository) {
                     }
                     Spacer(modifier = Modifier.height(8.dp))
                     
+                    // Google Photos UI
+                    Card(
+                        modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
+                        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.secondaryContainer)
+                    ) {
+                        Column(modifier = Modifier.padding(12.dp)) {
+                            Text("Google Photos", style = MaterialTheme.typography.titleMedium, color = MaterialTheme.colorScheme.onSecondaryContainer)
+                            
+                            if (googleAccount == null) {
+                                Button(
+                                    onClick = {
+                                        val intent = GoogleSignInHelper.getSignInIntent(context)
+                                        googleSignInLauncher.launch(intent)
+                                    },
+                                    modifier = Modifier.fillMaxWidth().padding(top = 8.dp)
+                                ) {
+                                    Text("Sign in with Google")
+                                }
+                            } else {
+                                Text("Signed in as: ${googleAccount?.email}", style = MaterialTheme.typography.bodySmall)
+                                
+                                Row(
+                                    modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
+                                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                                ) {
+                                    Button(
+                                        onClick = {
+                                            GoogleSignInHelper.signOut(context)
+                                            googleAccount = null
+                                        },
+                                        colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error),
+                                        modifier = Modifier.weight(1f)
+                                    ) {
+                                        Text("Sign Out")
+                                    }
+                                    
+                                    Button(
+                                        onClick = {
+                                            if (isGoogleUploading) {
+                                                logToUiAndFile(context, "Stopping Google Photos Upload Service...")
+                                                try {
+                                                    val intent = Intent(context, GooglePhotosUploadService::class.java)
+                                                    context.stopService(intent)
+                                                    GooglePhotosUploadManager.setUploading(false)
+                                                    logToUiAndFile(context, "Service stop requested.")
+                                                } catch (e: Exception) {
+                                                    logToUiAndFile(context, "Error stopping service: ${e.message}")
+                                                }
+                                            } else {
+                                                val hasPermission = if (Build.VERSION.SDK_INT >= 30) {
+                                                    Environment.isExternalStorageManager()
+                                                } else {
+                                                    androidx.core.content.ContextCompat.checkSelfPermission(context, Manifest.permission.READ_EXTERNAL_STORAGE) == android.content.pm.PackageManager.PERMISSION_GRANTED
+                                                }
+                                                
+                                                if (!hasPermission) {
+                                                    logToUiAndFile(context, "Storage permission is required to scan files.")
+                                                    if (Build.VERSION.SDK_INT >= 30) {
+                                                        logToUiAndFile(context, "Redirecting to Android 11+ All Files Access settings...")
+                                                        try {
+                                                            val permIntent = android.content.Intent(android.provider.Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION)
+                                                            permIntent.data = android.net.Uri.parse("package:${context.packageName}")
+                                                            context.startActivity(permIntent)
+                                                        } catch (e: Exception) {
+                                                            val permIntent = android.content.Intent(android.provider.Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION)
+                                                            context.startActivity(permIntent)
+                                                        }
+                                                    } else {
+                                                        logToUiAndFile(context, "Requesting classic storage permissions for Android 10...")
+                                                        storagePermissionLauncher.launch(
+                                                            arrayOf(
+                                                                Manifest.permission.READ_EXTERNAL_STORAGE,
+                                                                Manifest.permission.WRITE_EXTERNAL_STORAGE
+                                                            )
+                                                        )
+                                                    }
+                                                } else {
+                                                    logToUiAndFile(context, "Starting Google Photos Upload Service...")
+                                                    try {
+                                                        val intent = Intent(context, GooglePhotosUploadService::class.java)
+                                                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                                                            context.startForegroundService(intent)
+                                                        } else {
+                                                            context.startService(intent)
+                                                        }
+                                                        logToUiAndFile(context, "Service start requested successfully.")
+                                                    } catch (e: Exception) {
+                                                        logToUiAndFile(context, "Error starting service: ${e.message}")
+                                                        e.printStackTrace()
+                                                    }
+                                                }
+                                            }
+                                        },
+                                        modifier = Modifier.weight(2f)
+                                    ) {
+                                        Text(if (isGoogleUploading) "Stop Upload" else "Start Upload to Google Photos")
+                                    }
+                                }
+                                
+                                if (isGoogleUploading || googleUploadProgress > 0) {
+                                    Spacer(modifier = Modifier.height(8.dp))
+                                    Text(googleUploadStatus, style = MaterialTheme.typography.bodySmall)
+                                    LinearProgressIndicator(
+                                        progress = googleUploadProgress / 100f,
+                                        modifier = Modifier.fillMaxWidth().padding(top = 4.dp)
+                                    )
+                                }
+                            }
+                        }
+                    }
+                    
                     if (showDebugLog) {
                     val scrollState = rememberScrollState()
                     var oldMax by remember { mutableStateOf(0) }
@@ -1340,6 +1530,19 @@ fun SynologyDownloaderApp(repository: SynologyRepository) {
                         }
                     },
                     icon = { Icon(Icons.Default.Info, contentDescription = null, tint = MaterialTheme.colorScheme.error) }
+                )
+            }
+            
+            if (googleSignInError != null) {
+                AlertDialog(
+                    onDismissRequest = { googleSignInError = null },
+                    title = { Text("Google 로그인 에러") },
+                    text = { Text(googleSignInError!!) },
+                    confirmButton = {
+                        TextButton(onClick = { googleSignInError = null }) {
+                            Text("확인")
+                        }
+                    }
                 )
             }
             
@@ -1431,7 +1634,7 @@ fun SynologyDownloaderApp(repository: SynologyRepository) {
     }
 }
 
-// FileUtils functions moved to com.example.test.utils package
+// FileUtils functions moved to com.bjkim.nas2gp.utils package
 
 suspend fun reDownloadFiles(
     context: Context,
@@ -1666,3 +1869,4 @@ fun renameScannedFiles(scanResults: List<List<String>>, onLog: (String) -> Unit)
     }
     return renamedCount
 }
+

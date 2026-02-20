@@ -1,4 +1,4 @@
-package com.example.test.ui.theme
+﻿package com.bjkim.nas2gp.ui.theme
 
 import android.app.Activity
 import android.os.Build

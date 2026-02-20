@@ -1,4 +1,4 @@
-package com.example.test.service
+﻿package com.bjkim.nas2gp.service
 
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -11,11 +11,11 @@ import android.os.Environment
 import android.os.IBinder
 import android.os.PowerManager
 import androidx.core.app.NotificationCompat
-import com.example.test.MainActivity
-import com.example.test.model.BackupJob
-import com.example.test.network.FileInfo
-import com.example.test.utils.appendLog
-import com.example.test.utils.saveToMediaStore
+import com.bjkim.nas2gp.MainActivity
+import com.bjkim.nas2gp.model.BackupJob
+import com.bjkim.nas2gp.network.FileInfo
+import com.bjkim.nas2gp.utils.appendLog
+import com.bjkim.nas2gp.utils.saveToMediaStore
 import kotlinx.coroutines.*
 import java.io.File
 import java.util.concurrent.atomic.AtomicBoolean
@@ -455,3 +455,4 @@ class BackupService : Service() {
         super.onDestroy()
     }
 }
+

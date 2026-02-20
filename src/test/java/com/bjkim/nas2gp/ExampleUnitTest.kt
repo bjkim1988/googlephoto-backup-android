@@ -1,4 +1,4 @@
-package com.example.test
+﻿package com.bjkim.nas2gp
 
 import org.junit.Test
 

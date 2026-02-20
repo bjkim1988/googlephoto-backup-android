@@ -1,4 +1,4 @@
-package com.example.test.network
+﻿package com.bjkim.nas2gp.network
 
 import okhttp3.ResponseBody
 import retrofit2.Response
@@ -196,3 +196,4 @@ data class CopyMoveStatusData(
 data class CreateFolderResponse(
     val success: Boolean
 )
+

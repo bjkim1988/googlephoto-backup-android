@@ -1,6 +1,6 @@
-package com.example.test.model
+﻿package com.bjkim.nas2gp.model
 
-import com.example.test.network.FileInfo
+import com.bjkim.nas2gp.network.FileInfo
 
 sealed class BackupJob {
     abstract val label: String
@@ -19,3 +19,4 @@ sealed class BackupJob {
         override val label = if (moveOnNas) "Backup (${files.size} files)" else "Download (${files.size} files)"
     }
 }
+

@@ -1,7 +1,7 @@
-package com.example.test.service
+﻿package com.bjkim.nas2gp.service
 
-import com.example.test.model.BackupJob
-import com.example.test.repository.SynologyRepository
+import com.bjkim.nas2gp.model.BackupJob
+import com.bjkim.nas2gp.repository.SynologyRepository
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 
@@ -58,3 +58,4 @@ object BackupManager {
         debugLog.value += msg + "\n"
     }
 }
+
