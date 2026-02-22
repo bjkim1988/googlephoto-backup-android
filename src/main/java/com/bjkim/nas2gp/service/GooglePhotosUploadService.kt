@@ -66,7 +66,7 @@ class GooglePhotosUploadService : Service() {
 
     private suspend fun processUploads() {
         com.bjkim.nas2gp.service.BackupManager.appendLog("processUploads: started.")
-        GooglePhotosUploadManager.setUploading(true)
+        com.bjkim.nas2gp.service.GooglePhotosUploadManager.setUploading(true)
         wakeLock?.acquire(12 * 60 * 60 * 1000L) // 12 hours max
         
         try {
@@ -74,8 +74,8 @@ class GooglePhotosUploadService : Service() {
             com.bjkim.nas2gp.service.BackupManager.appendLog("processUploads: Getting Google Sign-In Account...")
             val account = GoogleSignInHelper.getLastSignedInAccount(this)
             if (account == null) {
-                GooglePhotosUploadManager.statusMessage.value = "Error: Not signed in or missing scopes"
-                com.bjkim.nas2gp.service.BackupManager.appendLog("processUploads: account is null")
+                com.bjkim.nas2gp.service.GooglePhotosUploadManager.statusMessage.value = "Error: Not signed in or missing scopes"
+                com.bjkim.nas2gp.service.BackupManager.appendLog("processUploads: Error: Not signed in or missing scopes. Cannot start Service.")
                 return
             }
 
@@ -106,7 +106,7 @@ class GooglePhotosUploadService : Service() {
             val nasDir = File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS), "nas")
             
             if (!nasDir.exists() || !nasDir.isDirectory) {
-                GooglePhotosUploadManager.statusMessage.value = "NAS directory not found"
+                com.bjkim.nas2gp.service.GooglePhotosUploadManager.statusMessage.value = "NAS directory not found"
                 com.bjkim.nas2gp.service.BackupManager.appendLog("processUploads: NAS directory not found: ${nasDir.absolutePath}")
                 return
             }
@@ -128,6 +128,7 @@ class GooglePhotosUploadService : Service() {
                 }
                 .forEach { file ->
                     if (file.isFile && !file.name.equals("folder.jpg", ignoreCase = true) 
+                        && !file.name.endsWith("-poster.jpg", ignoreCase = true)
                         && !file.name.equals("Thumbs.db", ignoreCase = true)
                         && file.name.substringAfterLast('.', "").lowercase() != "nfo"
                         && file.name != "@eaDir" // Avoid symlink loops / thumb dirs if synced
@@ -139,40 +140,51 @@ class GooglePhotosUploadService : Service() {
                         }
                     }
                 }
+            
+            // 3.5 Calculate initial Total Bytes
+            var targetBytes = 0L
+            val pendingFiles = mutableListOf<File>()
+            for (f in filesToUpload) {
+                if (!db.uploadedFileDao().isUploaded(f.absolutePath)) {
+                    pendingFiles.add(f)
+                    targetBytes += f.length()
+                }
+            }
+            
+            com.bjkim.nas2gp.service.GooglePhotosUploadManager.totalBytesTarget.value = targetBytes
+            com.bjkim.nas2gp.service.GooglePhotosUploadManager.totalBytesUploaded.value = 0L
+            com.bjkim.nas2gp.service.GooglePhotosUploadManager.currentFileBytesUploaded.value = 0L
+            com.bjkim.nas2gp.service.GooglePhotosUploadManager.currentFileTotalBytes.value = 0L
+            com.bjkim.nas2gp.service.GooglePhotosUploadManager.etaString.value = "Calculating..."
 
             com.bjkim.nas2gp.service.BackupManager.appendLog("processUploads: Scanned directory [${nasDir.absolutePath}]. Found ${filesToUpload.size} matching files.")
-            GooglePhotosUploadManager.statusMessage.value = "Found ${filesToUpload.size} matching files"
+            com.bjkim.nas2gp.service.GooglePhotosUploadManager.statusMessage.value = "Found ${filesToUpload.size} matching files"
             
             var processed = 0
             var uploadedCount = 0
-            var skippedCount = 0
             
             val notificationManager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
 
+            val startTime = System.currentTimeMillis()
+            var totalUploadedSoFar = 0L
+
             // 4. Iterate and upload
-            for (file in filesToUpload) {
+            for (file in pendingFiles) {
                 if (isStopping.get()) {
                     com.bjkim.nas2gp.service.BackupManager.appendLog("processUploads: Stopping upload loop because isStopping=true")
                     break
                 }
                 
                 processed++
-                val progress = (processed * 100) / filesToUpload.size
+                val fileNumberProgress = (processed * 100) / pendingFiles.size
                 
-                // Check if already uploaded
-                val isUploaded = db.uploadedFileDao().isUploaded(file.absolutePath)
-                if (isUploaded) {
-                    skippedCount++
-                    continue
-                }
-
-                GooglePhotosUploadManager.progress.value = progress
-                GooglePhotosUploadManager.statusMessage.value = "Uploading $processed/${filesToUpload.size}: ${file.name}"
+                com.bjkim.nas2gp.service.GooglePhotosUploadManager.progress.value = fileNumberProgress
+                com.bjkim.nas2gp.service.GooglePhotosUploadManager.statusMessage.value = "Uploading $processed/${pendingFiles.size}: ${file.name}"
                 
                 val notification = createNotification(
-                    "Google Photos Upload: $progress%", 
-                    "$processed/${filesToUpload.size}: ${file.name}", 
-                    100, progress, false
+                    "Google Photos Upload: $fileNumberProgress%", 
+                    "$processed/${pendingFiles.size}: ${file.name}", 
+                    100, fileNumberProgress, false
                 )
                 notificationManager.notify(2, notification)
 
@@ -185,9 +197,32 @@ class GooglePhotosUploadService : Service() {
                 // 4a. Upload raw bytes
                 try {
                     val totalBytes = file.length()
-                    val inputStream = FileInputStream(file)
+                    com.bjkim.nas2gp.service.GooglePhotosUploadManager.currentFileTotalBytes.value = totalBytes
+                    com.bjkim.nas2gp.service.GooglePhotosUploadManager.currentFileBytesUploaded.value = 0L
+                    
+                    // Periodic ETA calculation coroutine could go here, but since repo updates manager directly,
+                    // we can just let UI calculate ETA using a timer, or we update ETA here after each file.
+                    // Actually, let's just let UI derive ETA if it wants, or we update ETA in a separate loop.
+                    // A simple ETA updater:
+                    
+                    val inputStream = java.io.FileInputStream(file)
                     val uploadToken = repository.uploadBytesFromStream(accessToken, inputStream, mimeType, totalBytes)
                     inputStream.close()
+                    
+                    totalUploadedSoFar += totalBytes
+                    com.bjkim.nas2gp.service.GooglePhotosUploadManager.totalBytesUploaded.value = totalUploadedSoFar
+                    
+                    // Calculate basic ETA
+                    val elapsedMs = System.currentTimeMillis() - startTime
+                    if (elapsedMs > 5000 && totalUploadedSoFar > 0) {
+                        val bytesPerMs = totalUploadedSoFar.toDouble() / elapsedMs
+                        val remainingBytes = targetBytes - totalUploadedSoFar
+                        val remainingMs = (remainingBytes / bytesPerMs).toLong()
+                        val remainingSecs = remainingMs / 1000
+                        val mins = remainingSecs / 60
+                        val secs = remainingSecs % 60
+                        com.bjkim.nas2gp.service.GooglePhotosUploadManager.etaString.value = String.format("%02d:%02d", mins, secs)
+                    }
                     
                     if (uploadToken != null) {
                         com.bjkim.nas2gp.service.BackupManager.appendLog("processUploads: Bytes uploaded for ${file.name}, received uploadToken.")
@@ -205,29 +240,29 @@ class GooglePhotosUploadService : Service() {
                              com.bjkim.nas2gp.service.BackupManager.appendLog("processUploads: Successfully uploaded ${file.name}")
                         } else {
                             // API Error creating item
-                            GooglePhotosUploadManager.statusMessage.value = "Error creating item: ${itemResult.status.message}"
+                            com.bjkim.nas2gp.service.GooglePhotosUploadManager.statusMessage.value = "Error creating item: ${itemResult.status.message}"
                             com.bjkim.nas2gp.service.BackupManager.appendLog("processUploads: Error creating item ${file.name}: ${itemResult.status.message}")
                         }
                     } else {
-                        GooglePhotosUploadManager.statusMessage.value = "Failed to upload bytes for ${file.name}"
+                        com.bjkim.nas2gp.service.GooglePhotosUploadManager.statusMessage.value = "Failed to upload bytes for ${file.name}"
                         com.bjkim.nas2gp.service.BackupManager.appendLog("processUploads: Failed to get uploadToken for ${file.name}")
                     }
                 } catch (e: Exception) {
                     e.printStackTrace()
-                    GooglePhotosUploadManager.statusMessage.value = "Exception uploading ${file.name}: ${e.message}"
+                    com.bjkim.nas2gp.service.GooglePhotosUploadManager.statusMessage.value = "Exception uploading ${file.name}: ${e.message}"
                     com.bjkim.nas2gp.service.BackupManager.appendLog("processUploads: Exception uploading ${file.name}: ${e.message}")
                 }
             }
 
-            GooglePhotosUploadManager.statusMessage.value = "Upload Complete. Uploaded: $uploadedCount, Skipped: $skippedCount"
-            com.bjkim.nas2gp.service.BackupManager.appendLog("processUploads: Finished! Uploaded: $uploadedCount, Skipped: $skippedCount")
+            com.bjkim.nas2gp.service.GooglePhotosUploadManager.statusMessage.value = "Upload Complete. Uploaded: $uploadedCount"
+            com.bjkim.nas2gp.service.BackupManager.appendLog("processUploads: Finished! Uploaded: $uploadedCount")
             
         } catch (e: Exception) {
             e.printStackTrace()
-            GooglePhotosUploadManager.statusMessage.value = "Service Error: ${e.message}"
+            com.bjkim.nas2gp.service.GooglePhotosUploadManager.statusMessage.value = "Service Error: ${e.message}"
             com.bjkim.nas2gp.service.BackupManager.appendLog("processUploads caught exception: ${e.message}\n${android.util.Log.getStackTraceString(e)}")
         } finally {
-            GooglePhotosUploadManager.setUploading(false)
+            com.bjkim.nas2gp.service.GooglePhotosUploadManager.setUploading(false)
             if (wakeLock?.isHeld == true) {
                 wakeLock?.release()
             }

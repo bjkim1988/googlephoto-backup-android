@@ -15,9 +15,13 @@ import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.logging.HttpLoggingInterceptor
 import retrofit2.Retrofit
 import retrofit2.converter.gson.GsonConverterFactory
+import okio.BufferedSink
 import java.io.File
 import java.io.InputStream
 import java.util.concurrent.TimeUnit
+import okhttp3.MediaType
+import okhttp3.RequestBody
+import okio.source
 
 class GooglePhotosRepository {
 
@@ -75,8 +79,29 @@ class GooglePhotosRepository {
     suspend fun uploadBytesFromStream(accessToken: String, inputStream: InputStream, mimeType: String, totalBytes: Long): String? {
         return try {
             val authHeader = "Bearer $accessToken"
-            val bytes = inputStream.readBytes()
-            val requestBody = bytes.toRequestBody("application/octet-stream".toMediaTypeOrNull())
+            
+            val requestBody = object : RequestBody() {
+                override fun contentType(): MediaType? = "application/octet-stream".toMediaTypeOrNull()
+
+                override fun contentLength(): Long = totalBytes
+
+                override fun writeTo(sink: BufferedSink) {
+                    val buffer = ByteArray(1024 * 64) // 64KB chunk
+                    var uploaded = 0L
+                    var read: Int
+
+                    inputStream.use { input ->
+                        while (input.read(buffer).also { read = it } != -1) {
+                            sink.write(buffer, 0, read)
+                            uploaded += read
+                            
+                            // Update current file progress
+                            com.bjkim.nas2gp.service.GooglePhotosUploadManager.currentFileBytesUploaded.value = uploaded
+                            com.bjkim.nas2gp.service.GooglePhotosUploadManager.progress.value = ((uploaded.toDouble() / totalBytes) * 100).toInt()
+                        }
+                    }
+                }
+            }
             
             val response = api.uploadBytes(
                 authHeader = authHeader,

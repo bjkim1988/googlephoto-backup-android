@@ -44,6 +44,12 @@ import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.TextUnit
+import androidx.compose.foundation.Image
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.layout.ContentScale
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.ui.draw.clip
+import androidx.compose.foundation.lazy.LazyRow
 import com.bjkim.nas2gp.network.FileInfo
 import com.bjkim.nas2gp.network.AdditionalInfo
 import com.bjkim.nas2gp.repository.SynologyRepository
@@ -68,6 +74,7 @@ import com.google.android.gms.common.api.ApiException
 import androidx.compose.material3.TextButton
 import androidx.compose.foundation.layout.heightIn
 import java.io.FileOutputStream
+import java.io.FileInputStream
 import java.io.InputStream
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.launch
@@ -201,9 +208,16 @@ fun SynologyDownloaderApp(repository: SynologyRepository) {
     // Google Photos State
     var googleAccount by remember { mutableStateOf<GoogleSignInAccount?>(null) }
     var googleSignInError by remember { mutableStateOf<String?>(null) }
-    val isGoogleUploading by GooglePhotosUploadManager.isUploading.collectAsState()
-    val googleUploadProgress by GooglePhotosUploadManager.progress.collectAsState()
-    val googleUploadStatus by GooglePhotosUploadManager.statusMessage.collectAsState()
+    val isGoogleUploading by com.bjkim.nas2gp.service.GooglePhotosUploadManager.isUploading.collectAsState()
+    val googleUploadProgress by com.bjkim.nas2gp.service.GooglePhotosUploadManager.progress.collectAsState()
+    val googleUploadStatus by com.bjkim.nas2gp.service.GooglePhotosUploadManager.statusMessage.collectAsState()
+    val googleTotalBytesTarget by com.bjkim.nas2gp.service.GooglePhotosUploadManager.totalBytesTarget.collectAsState()
+    val googleTotalBytesUploaded by com.bjkim.nas2gp.service.GooglePhotosUploadManager.totalBytesUploaded.collectAsState()
+    val googleCurrentFileBytesUploaded by com.bjkim.nas2gp.service.GooglePhotosUploadManager.currentFileBytesUploaded.collectAsState()
+    val googleCurrentFileTotalBytes by com.bjkim.nas2gp.service.GooglePhotosUploadManager.currentFileTotalBytes.collectAsState()
+    val googleEtaString by com.bjkim.nas2gp.service.GooglePhotosUploadManager.etaString.collectAsState()
+    
+    val splitThumbnails by BackupManager.splitThumbnails.collectAsState()
     
     val googleSignInLauncher = rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
         logToUiAndFile(context, "Google Sign-In result code: ${result.resultCode}")
@@ -247,7 +261,7 @@ fun SynologyDownloaderApp(repository: SynologyRepository) {
 
     // Load last session log on startup
     LaunchedEffect(Unit) {
-        val lastLog = withContext(Dispatchers.IO) { readLastLog(context) }
+        val lastLog: String = withContext(Dispatchers.IO) { readLastLog(context) }
         if (lastLog.isNotEmpty()) {
             BackupManager.debugLog.value = "--- LAST SESSION LOG (Potential Crash Context) ---\n$lastLog\n--------------------------\n"
         }
@@ -283,7 +297,8 @@ fun SynologyDownloaderApp(repository: SynologyRepository) {
             withContext(Dispatchers.IO) {
                 try {
                     val files = repository.listFiles(path).filter { 
-                        !it.name.equals("folder.jpg", ignoreCase = true) 
+                        !it.name.equals("folder.jpg", ignoreCase = true) &&
+                        !it.name.endsWith("-poster.jpg", ignoreCase = true)
                     }
                     withContext(Dispatchers.Main) {
                         fileList = files
@@ -1042,6 +1057,28 @@ fun SynologyDownloaderApp(repository: SynologyRepository) {
             }
             
             Spacer(modifier = Modifier.height(8.dp))
+            
+            if (splitThumbnails.isNotEmpty()) {
+                Text("Verification (Split Point Frames):", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.secondary)
+                LazyRow(
+                    modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    items(splitThumbnails) { bitmap ->
+                        Image(
+                            bitmap = bitmap.asImageBitmap(),
+                            contentDescription = "Split Point",
+                            modifier = Modifier
+                                .height(80.dp)
+                                .width(120.dp)
+                                .clip(RoundedCornerShape(8.dp))
+                                .border(1.dp, MaterialTheme.colorScheme.outlineVariant, RoundedCornerShape(8.dp)),
+                            contentScale = ContentScale.Crop
+                        )
+                    }
+                }
+            }
+
             Text(text = statusMessage, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.primary)
             
             // Debug Log UI with Auto-Scroll
@@ -1057,6 +1094,7 @@ fun SynologyDownloaderApp(repository: SynologyRepository) {
                     var checkAllFiles by remember { mutableStateOf(false) }
                     var checkMetadata by remember { mutableStateOf(true) }
                     var checkDate by remember { mutableStateOf(false) }
+                    var checkLargeFiles by remember { mutableStateOf(false) }
                     var dateString by remember { mutableStateOf(SimpleDateFormat("yyyy-MM-dd", Locale.getDefault()).format(Date())) }
                     
                     AlertDialog(
@@ -1084,6 +1122,10 @@ fun SynologyDownloaderApp(repository: SynologyRepository) {
                                     Checkbox(checked = checkAllFiles, onCheckedChange = { checkAllFiles = it })
                                     Text("List All Files")
                                 }
+                                Row(verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) {
+                                    Checkbox(checked = checkLargeFiles, onCheckedChange = { checkLargeFiles = it })
+                                    Text("Large Files (> 9.1GB)")
+                                }
                                 if (isScanning) {
                                     Spacer(modifier = Modifier.height(8.dp))
                                     LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
@@ -1105,7 +1147,8 @@ fun SynologyDownloaderApp(repository: SynologyRepository) {
                                             },
                                             checkMetadata,
                                             if(checkDate) dateString else null,
-                                            checkAllFiles
+                                            checkAllFiles,
+                                            checkLargeFiles
                                         )
                                         withContext(Dispatchers.Main) {
                                             scanResults = list
@@ -1114,7 +1157,7 @@ fun SynologyDownloaderApp(repository: SynologyRepository) {
                                         }
                                     }
                                 },
-                                enabled = !isScanning && (checkMetadata || checkDate || checkAllFiles)
+                                enabled = !isScanning && (checkMetadata || checkDate || checkAllFiles || checkLargeFiles)
                             ) { Text("Start Scan") }
                         },
                         dismissButton = {
@@ -1252,6 +1295,32 @@ fun SynologyDownloaderApp(repository: SynologyRepository) {
                                     colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.secondary)
                                 ) {
                                     Text("Rename (${selectedScanItems.size})")
+                                }
+                                Button(
+                                    onClick = {
+                                        if (selectedScanItems.isEmpty()) {
+                                            Toast.makeText(context, "No items selected", Toast.LENGTH_SHORT).show()
+                                            return@Button
+                                        }
+                                        val paths = selectedScanItems.map { it[0] }
+                                        val splitJob = BackupJob.SplitFiles(paths)
+                                        BackupManager.addToQueue(splitJob)
+                                        
+                                        // Start service if not running
+                                        val serviceIntent = Intent(context, BackupService::class.java)
+                                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                                            context.startForegroundService(serviceIntent)
+                                        } else {
+                                            context.startService(serviceIntent)
+                                        }
+                                        
+                                        Toast.makeText(context, "Split task added to queue", Toast.LENGTH_SHORT).show()
+                                        scanResults = null // Close dialog
+                                    },
+                                    enabled = !isReDownloading,
+                                    colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.tertiary)
+                                ) {
+                                    Text("Split (> 9.1GB)")
                                 }
                                 Spacer(modifier = Modifier.width(8.dp))
                                 Button(onClick = { scanResults = null }, enabled = !isReDownloading) { Text("Close") }
@@ -1403,7 +1472,7 @@ fun SynologyDownloaderApp(repository: SynologyRepository) {
                                                 try {
                                                     val intent = Intent(context, GooglePhotosUploadService::class.java)
                                                     context.stopService(intent)
-                                                    GooglePhotosUploadManager.setUploading(false)
+                                                    com.bjkim.nas2gp.service.GooglePhotosUploadManager.setUploading(false)
                                                     logToUiAndFile(context, "Service stop requested.")
                                                 } catch (e: Exception) {
                                                     logToUiAndFile(context, "Error stopping service: ${e.message}")
@@ -1462,10 +1531,31 @@ fun SynologyDownloaderApp(repository: SynologyRepository) {
                                 if (isGoogleUploading || googleUploadProgress > 0) {
                                     Spacer(modifier = Modifier.height(8.dp))
                                     Text(googleUploadStatus, style = MaterialTheme.typography.bodySmall)
+                                    
+                                    // Current File Progress
+                                    if (googleCurrentFileTotalBytes > 0) {
+                                        val currentMb = googleCurrentFileBytesUploaded / (1024f * 1024f)
+                                        val totalMb = googleCurrentFileTotalBytes / (1024f * 1024f)
+                                        Text(String.format(Locale.getDefault(), "File: %.1f MB / %.1f MB", currentMb, totalMb), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.primary)
+                                    }
                                     LinearProgressIndicator(
-                                        progress = googleUploadProgress / 100f,
-                                        modifier = Modifier.fillMaxWidth().padding(top = 4.dp)
+                                        progress = if (googleCurrentFileTotalBytes > 0) (googleCurrentFileBytesUploaded.toFloat() / googleCurrentFileTotalBytes) else (googleUploadProgress / 100f),
+                                        modifier = Modifier.fillMaxWidth().padding(top = 4.dp, bottom = 8.dp)
                                     )
+                                    
+                                    // Overall Job Progress
+                                    if (googleTotalBytesTarget > 0) {
+                                        val overallMb = googleTotalBytesUploaded / (1024f * 1024f)
+                                        val targetMb = googleTotalBytesTarget / (1024f * 1024f)
+                                        val etaText = if (googleEtaString.isNotEmpty()) " (ETA: $googleEtaString)" else ""
+                                        Text(String.format(Locale.getDefault(), "Overall: %.1f MB / %.1f MB%s", overallMb, targetMb, etaText), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.secondary)
+                                        
+                                        LinearProgressIndicator(
+                                            progress = googleTotalBytesUploaded.toFloat() / googleTotalBytesTarget,
+                                            modifier = Modifier.fillMaxWidth().padding(top = 4.dp),
+                                            color = MaterialTheme.colorScheme.secondary
+                                        )
+                                    }
                                 }
                             }
                         }
@@ -1756,7 +1846,7 @@ fun repairFile(file: File, time: Long): Boolean {
     }
 }
 
-suspend fun scanForIssues(onLog: (String) -> Unit, checkMetadata: Boolean, targetDate: String?, includeAllFiles: Boolean = false): List<List<String>> {
+suspend fun scanForIssues(onLog: (String) -> Unit, checkMetadata: Boolean, targetDate: String?, includeAllFiles: Boolean = false, checkLargeFiles: Boolean = false): List<List<String>> {
     val downloadDir = android.os.Environment.getExternalStoragePublicDirectory(android.os.Environment.DIRECTORY_DOWNLOADS)
     val nasDir = File(downloadDir, "nas")
     val list = mutableListOf<List<String>>()
@@ -1823,6 +1913,14 @@ suspend fun scanForIssues(onLog: (String) -> Unit, checkMetadata: Boolean, targe
             if (targetTimeRange != null) {
                 if (file.lastModified() in targetTimeRange.first until targetTimeRange.second) {
                     reasons.add("Modified on $targetDate")
+                }
+            }
+            
+            if (checkLargeFiles) {
+                val ninePointOneGb = (9.1 * 1024 * 1024 * 1024).toLong()
+                if (file.length() >= ninePointOneGb) {
+                    val sizeGb = file.length().toDouble() / (1024 * 1024 * 1024)
+                    reasons.add(String.format(Locale.getDefault(), "Large File (%.2f GB)", sizeGb))
                 }
             }
             

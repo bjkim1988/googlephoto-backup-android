@@ -20,6 +20,7 @@ object BackupManager {
     val progress = MutableStateFlow(0)
     val currentFile = MutableStateFlow("")
     val storageStats = MutableStateFlow<Pair<Long, Long>?>(null)
+    val splitThumbnails = MutableStateFlow<List<android.graphics.Bitmap>>(emptyList())
     
     // Config
     var username: String = ""

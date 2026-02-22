@@ -8,8 +8,16 @@ object GooglePhotosUploadManager {
     val isUploading = _isUploading.asStateFlow()
 
     val statusMessage = MutableStateFlow("Ready to Upload")
-    val progress = MutableStateFlow(0)
+    val progress = MutableStateFlow(0) // percentage 0-100
     
+    val currentFileBytesUploaded = MutableStateFlow(0L)
+    val currentFileTotalBytes = MutableStateFlow(0L)
+    
+    val totalBytesUploaded = MutableStateFlow(0L)
+    val totalBytesTarget = MutableStateFlow(0L)
+    
+    val etaString = MutableStateFlow("")
+
     fun setUploading(uploading: Boolean) {
         _isUploading.value = uploading
     }

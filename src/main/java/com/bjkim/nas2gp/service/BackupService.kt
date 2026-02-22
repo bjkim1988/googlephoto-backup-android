@@ -74,6 +74,7 @@ class BackupService : Service() {
                 processJob(currentJob)
             }
         } catch (e: Exception) {
+            if (e is CancellationException) throw e
             e.printStackTrace()
             BackupManager.appendLog("Service Error: ${e.message}")
         } finally {
@@ -108,6 +109,32 @@ class BackupService : Service() {
                  return
             }
             
+            if (job is BackupJob.SplitFiles) {
+                val notificationManager = getSystemService(Context.NOTIFICATION_SERVICE) as android.app.NotificationManager
+                var lastStatsUpdateTime = 0L
+                com.bjkim.nas2gp.utils.splitLargeFiles(this, job.filePaths, 
+                    onLog = { msg ->
+                       BackupManager.appendLog(msg)
+                       BackupManager.statusMessage.value = "Splitting: $msg"
+                    },
+                    onProgress = { progress ->
+                       BackupManager.progress.value = progress
+                       
+                       val currentTime = System.currentTimeMillis()
+                       if (currentTime - lastStatsUpdateTime > 3000) { // Update stats every 3 seconds
+                           val externalDir = Environment.getExternalStorageDirectory()
+                           BackupManager.storageStats.value = Pair(externalDir.totalSpace, externalDir.freeSpace)
+                           lastStatsUpdateTime = currentTime
+                       }
+
+                       val notification = createNotification("Splitting large files", "$progress%", 100, progress, false)
+                       notificationManager.notify(1, notification)
+                    }
+                )
+                BackupManager.appendLog("=== Split Task Finished ===")
+                return
+            }
+
             // Get files to process
             val candidateFiles = when (job) {
                 is BackupJob.RecursiveBackup -> {
@@ -117,6 +144,7 @@ class BackupService : Service() {
                     }
                 }
                 is BackupJob.SelectedBackup -> job.files
+                else -> emptyList() // Should not happen with current sealed class
             }
             
             BackupManager.appendLog("Found ${candidateFiles.size} candidate files")
@@ -126,7 +154,7 @@ class BackupService : Service() {
             val videoExtensions = setOf("mp4", "mov", "avi", "mkv", "wmv", "flv", "webm", "m4v", "3gp", "mpeg", "mpg")
 
             val filesToDownload = candidateFiles.filter { file ->
-                if (file.name.equals("folder.jpg", ignoreCase = true)) return@filter false
+                if (file.name.equals("folder.jpg", ignoreCase = true) || file.name.endsWith("-poster.jpg", ignoreCase = true)) return@filter false
                 val ext = file.name.substringAfterLast('.', "").lowercase()
                 ext in imageExtensions || ext in videoExtensions
             }
@@ -345,68 +373,87 @@ class BackupService : Service() {
              }
              
              // Cleanup empty dirs and junk files
-             BackupManager.appendLog("Checking for empty directories and junk files...")
-             val dirsToCheck = mutableSetOf<String>()
-
-             if (job is BackupJob.RecursiveBackup) {
-                 val dirQueue = ArrayDeque<String>()
-                 dirQueue.add(job.sourcePath)
-                 dirsToCheck.add(job.sourcePath)
-                 while (dirQueue.isNotEmpty()) {
-                     val dir = dirQueue.removeFirst()
-                     val items = repository.listFiles(dir)
-                     for (item in items) {
-                         if (item.isdir) {
-                             dirsToCheck.add(item.path)
-                             dirQueue.add(item.path)
+             BackupManager.appendLog("Checking for potential empty directories and junk files...")
+             
+             // 1. Local Cleanup (Always run to keep Downloads/nas clean)
+             val localNasDir = File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS), "nas")
+             if (localNasDir.exists()) {
+                 val localDeleted = com.bjkim.nas2gp.utils.deleteEmptyDirectories(localNasDir)
+                 if (localDeleted > 0) BackupManager.appendLog("Cleaned up $localDeleted empty local directories")
+             }
+             
+             // 2. NAS Cleanup (Only if we moved files)
+             if (job.moveOnNas) {
+                 val dirsToCheck = mutableSetOf<String>()
+                 if (job is BackupJob.RecursiveBackup) {
+                     val dirQueue = ArrayDeque<String>()
+                     dirQueue.add(job.sourcePath)
+                     dirsToCheck.add(job.sourcePath)
+                     while (dirQueue.isNotEmpty()) {
+                         val dir = dirQueue.removeFirst()
+                         val items = repository.listFiles(dir)
+                         for (item in items) {
+                             if (item.isdir) {
+                                 dirsToCheck.add(item.path)
+                                 dirQueue.add(item.path)
+                             }
+                         }
+                     }
+                 } else if (job is BackupJob.SelectedBackup) {
+                     for (file in job.files) {
+                         var currentPath = file.path.substringBeforeLast('/')
+                         while (currentPath.isNotEmpty() && currentPath.length >= job.sourcePath.length) {
+                             if (currentPath.startsWith(job.sourcePath)) {
+                                 dirsToCheck.add(currentPath)
+                             }
+                             val nextPath = currentPath.substringBeforeLast('/')
+                             if (nextPath == currentPath) break
+                             currentPath = nextPath
                          }
                      }
                  }
-             } else if (job is BackupJob.SelectedBackup) {
-                 for (file in job.files) {
-                     var currentPath = file.path.substringBeforeLast('/')
-                     while (currentPath.isNotEmpty() && currentPath.length >= job.sourcePath.length) {
-                         if (currentPath.startsWith(job.sourcePath)) {
-                             dirsToCheck.add(currentPath)
+    
+                 var deletedDirs = 0
+                 var deletedJunkFiles = 0
+                 val sortedDirs = dirsToCheck.sortedByDescending { it.length }
+    
+                 for (dir in sortedDirs) {
+                     if (isStopping.get()) break
+                     val contents = repository.listFiles(dir)
+                     
+                     // Auto-delete junk files
+                     val junkFiles = contents.filter { !it.isdir && (
+                         it.name.equals("Thumbs.db", ignoreCase = true) || 
+                         it.name.substringAfterLast('.', "").lowercase() == "nfo" ||
+                         it.name.equals("folder.jpg", ignoreCase = true) ||
+                         it.name.endsWith("-poster.jpg", ignoreCase = true)
+                     ) }
+                     for (junk in junkFiles) {
+                         val result = repository.deleteFile(junk.path)
+                         if (result == "Success") deletedJunkFiles++
+                     }
+                     
+                     // Check if empty after deleting junk files
+                     val remainingContents = contents.filter { it.isdir || !junkFiles.contains(it) }
+                     val isEffectivelyEmpty = remainingContents.isEmpty() || remainingContents.all { it.isdir && it.name == "@eaDir" }
+                     
+                     if (isEffectivelyEmpty) {
+                         val result = repository.deleteFile(dir)
+                         if (result == "Success") {
+                             deletedDirs++
+                             BackupManager.appendLog(" - Deleted empty NAS dir: $dir")
                          }
-                         val nextPath = currentPath.substringBeforeLast('/')
-                         if (nextPath == currentPath) break
-                         currentPath = nextPath
                      }
                  }
+    
+                 if (deletedJunkFiles > 0) BackupManager.appendLog("Cleaned up $deletedJunkFiles junk files on NAS (.nfo, folder.jpg, Thumbs.db, etc.)")
+                 if (deletedDirs > 0) BackupManager.appendLog("Cleaned up $deletedDirs empty directories on NAS")
              }
-
-             var deletedDirs = 0
-             var deletedJunkFiles = 0
-             val sortedDirs = dirsToCheck.sortedByDescending { it.length }
-
-             for (dir in sortedDirs) {
-                 val contents = repository.listFiles(dir)
-                 
-                 // Auto-delete junk files
-                 val junkFiles = contents.filter { !it.isdir && (it.name.equals("Thumbs.db", ignoreCase = true) || it.name.substringAfterLast('.', "").lowercase() == "nfo") }
-                 for (junk in junkFiles) {
-                     val result = repository.deleteFile(junk.path)
-                     if (result == "Success") deletedJunkFiles++
-                 }
-                 
-                 // Check if empty after deleting junk files
-                 val remainingContents = contents.filter { it.isdir || !junkFiles.contains(it) }
-                 
-                 val isEffectivelyEmpty = remainingContents.isEmpty() || remainingContents.all { it.isdir && it.name == "@eaDir" }
-                 
-                 if (isEffectivelyEmpty) {
-                     val result = repository.deleteFile(dir)
-                     if (result == "Success") deletedDirs++
-                 }
-             }
-
-             if (deletedJunkFiles > 0) BackupManager.appendLog("Cleaned up $deletedJunkFiles junk files (.nfo, Thumbs.db)")
-             if (deletedDirs > 0) BackupManager.appendLog("Cleaned up $deletedDirs empty directories")
              
              BackupManager.appendLog("Job Done. Processed $filesDone files.")
              
         } catch (e: Exception) {
+            if (e is CancellationException) throw e
             e.printStackTrace()
             BackupManager.appendLog("Job Failed: ${e.message}")
         }
