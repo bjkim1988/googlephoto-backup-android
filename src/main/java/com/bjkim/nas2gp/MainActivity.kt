@@ -143,7 +143,7 @@ fun SynologyDownloaderApp(repository: SynologyRepository) {
     var username by remember { mutableStateOf(savedUser) }
     var password by remember { mutableStateOf("") }
     var otpCode by remember { mutableStateOf("") }
-    var sourcePath by remember { mutableStateOf("/photo") }
+    var sourcePath by remember { mutableStateOf("/") }
 
     var fileList by remember { mutableStateOf<List<FileInfo>>(emptyList()) }
 
@@ -315,7 +315,7 @@ fun SynologyDownloaderApp(repository: SynologyRepository) {
 
     // Handle back button
     BackHandler(enabled = isLoggedIn) {
-        if (sourcePath == "/photo" || sourcePath == "/") {
+        if (sourcePath == "/") {
             (context as? Activity)?.finish()
         } else {
             val lastSlash = sourcePath.lastIndexOf('/')
@@ -973,7 +973,7 @@ fun SynologyDownloaderApp(repository: SynologyRepository) {
 
 
             LazyColumn(modifier = Modifier.weight(1f)) {
-                if (sourcePath != "/" && sourcePath != "/photo" && sourcePath.isNotEmpty()) {
+                if (sourcePath != "/" && sourcePath.isNotEmpty()) {
                     item {
                         Row(
                             modifier = Modifier

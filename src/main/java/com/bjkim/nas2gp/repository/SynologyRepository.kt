@@ -142,7 +142,17 @@ class SynologyRepository {
     suspend fun listFiles(folderPath: String): List<FileInfo> {
         return try {
             if (sid == null) return emptyList()
+
+            // For root path, manually return known entry points as requested
+            if (folderPath == "/" || folderPath.isEmpty()) {
+                return listOf(
+                    FileInfo(path = "/photo", name = "photo", isdir = true),
+                    FileInfo(path = "/homes", name = "homes", isdir = true)
+                )
+            }
+
             val response = api?.listFiles(folderPath = folderPath, additional = "[\"size\",\"time\"]", sid = sid!!)
+
             if (response?.isSuccessful == true && response.body()?.success == true) {
                 response.body()?.data?.files?.filter { 
                     it.name != "#recycle" && 

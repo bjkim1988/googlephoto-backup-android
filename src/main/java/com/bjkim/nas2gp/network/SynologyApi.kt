@@ -34,6 +34,15 @@ interface SynologyApi {
         @Query("_sid") sid: String
     ): Response<ListResponse>
 
+    @GET("webapi/entry.cgi")
+    suspend fun listShare(
+        @Query("api") api: String = "SYNO.FileStation.List",
+        @Query("version") version: Int = 2,
+        @Query("method") method: String = "list_share",
+        @Query("additional") additional: String = "size,time",
+        @Query("_sid") sid: String
+    ): Response<ListResponse>
+
     @GET
     @Streaming
     suspend fun downloadFile(
