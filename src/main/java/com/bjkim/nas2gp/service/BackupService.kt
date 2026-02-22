@@ -195,14 +195,59 @@ class BackupService : Service() {
                 }
             }
             
-             BackupManager.appendLog("Plan: ${filesToProcess.size} files total. New downloads: ${potentialDownloadBytes / 1024} KB. Already local: ${alreadyDownloadedBytes / 1024} KB")
+             val totalScopeBytes = filesToProcess.sumOf { it.additional?.size ?: 0L }
+             BackupManager.totalBytesTarget.value = totalScopeBytes
+             BackupManager.totalBytesProcessed.value = 0L
+             BackupManager.etaString.value = ""
              
-             var currentDownloadedBytes = 0L
+             var currentProcessedBytes = 0L
              var filesDone = 0
              val backupStartTime = System.currentTimeMillis()
              var lastNotifyTime = 0L
-             var lastStorageReportBytes = 0L
              val notificationManager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+             var lastStorageReportBytes = 0L
+
+             fun updateGlobalProgress(increment: Long = 0L) {
+                 currentProcessedBytes += increment
+                 BackupManager.totalBytesProcessed.value = currentProcessedBytes
+                 
+                 val now = System.currentTimeMillis()
+                 if (now - lastNotifyTime > 1000) {
+                     lastNotifyTime = now
+                     val elapsedMs = now - backupStartTime
+                     val totalTarget = BackupManager.totalBytesTarget.value
+                     val processed = currentProcessedBytes
+                     
+                     // Speed calculation (bytes per second)
+                     val speed = if (elapsedMs > 0) processed.toDouble() / (elapsedMs / 1000.0) else 0.0
+                     val remainingBytes = totalTarget - processed
+                     val etaSec = if (speed > 0) (remainingBytes / speed).toLong() else 0L
+                     
+                     val etaText = if (etaSec > 0) {
+                         val h = etaSec / 3600
+                         val m = (etaSec % 3600) / 60
+                         val s = etaSec % 60
+                         if (h > 0) String.format("%02d:%02d:%02d", h, m, s) else String.format("%02d:%02d", m, s)
+                     } else "--:--"
+                     BackupManager.etaString.value = etaText
+                     
+                     val progressPercent = if (totalTarget > 0) (processed * 100 / totalTarget).toInt() else 0
+                     BackupManager.progress.value = progressPercent
+                     
+                     val processedStr = formatBytes(processed)
+                     val totalStr = formatBytes(totalTarget)
+                     val status = "Backing up: $processedStr / $totalStr (ETA: $etaText)"
+                     BackupManager.statusMessage.value = status
+                     
+                     val notification = NotificationCompat.Builder(this@BackupService, "backup_channel")
+                         .setContentTitle("NAS Backup: $filesDone/${filesToProcess.size}")
+                         .setContentText(status)
+                         .setSmallIcon(android.R.drawable.stat_sys_download)
+                         .setProgress(100, progressPercent, false)
+                         .build()
+                     notificationManager.notify(1, notification)
+                 }
+             }
 
              for ((index, file) in filesToProcess.withIndex()) {
                  if (isStopping.get()) break
@@ -232,6 +277,7 @@ class BackupService : Service() {
                 // Check if download is needed
                 if (targetFile.exists() && targetFile.length() == remoteSize) {
                     BackupManager.appendLog(" - [Local Match] ${file.name} (Proceeding to Move check)")
+                    updateGlobalProgress(remoteSize)
                     success = true
                 } else {
                     // Need to download. Check storage first.
@@ -247,20 +293,7 @@ class BackupService : Service() {
                        else -> "$remoteSize B"
                     }
                     
-                    // Progress calculation for display
-                    val progress = ((index + 1) * 100) / filesToProcess.size
                     BackupManager.statusMessage.value = "Downloading ${index+1}/${filesToProcess.size}: ${file.name}"
-                    BackupManager.progress.value = progress
-                    
-                    if (System.currentTimeMillis() - lastNotifyTime > 1000) {
-                        val notification = createNotification(
-                            "Backup: $progress%", 
-                            "${index + 1}/${filesToProcess.size}: ${file.name}", 
-                            100, progress, false
-                        )
-                        notificationManager.notify(1, notification)
-                        lastNotifyTime = System.currentTimeMillis()
-                    }
                     
                     var attempt = 1
                     while (!success && !isStopping.get()) {
@@ -281,8 +314,10 @@ class BackupService : Service() {
                            val mtime = file.additional?.time?.mtime ?: 0L
                            val lastModifiedMs = if (mtime > 0) mtime * 1000L else null
                            
-                           success = saveToMediaStore(context, stream, file.name, localSubDir, remoteSize, lastModifiedMs, atomicReplace = true) { msg ->
+                           success = saveToMediaStore(context, stream, file.name, localSubDir, remoteSize, lastModifiedMs, atomicReplace = true, onLog = { msg ->
                                BackupManager.appendLog(msg)
+                           }) { bytesCopied ->
+                               updateGlobalProgress(bytesCopied)
                            }
                        }
                        if (!success) attempt++
@@ -291,28 +326,21 @@ class BackupService : Service() {
                 }
 
                 if (success) {
-                    currentDownloadedBytes += remoteSize
-                    
-                    if (currentDownloadedBytes - lastStorageReportBytes > 100 * 1024 * 1024) {
+                    if (currentProcessedBytes - lastStorageReportBytes > 100 * 1024 * 1024) {
                         val dir = Environment.getExternalStorageDirectory()
                         BackupManager.storageStats.value = Pair(dir.totalSpace, dir.freeSpace)
-                        lastStorageReportBytes = currentDownloadedBytes
+                        lastStorageReportBytes = currentProcessedBytes
                     }
                     filesDone++
                     
                     if (job.moveOnNas) {
                         // Move on NAS
-                        var destFolder = "/homes/$username/google_photo_backup"
-                        if (file.path.startsWith("/photo/")) {
-                            val parentPath = file.path.substringBeforeLast('/')
-                            if (parentPath.length > "/photo".length) {
-                                val subPath = parentPath.substring("/photo".length)
-                                destFolder += subPath
-                            }
-                        }
+                        val backupRoot = "/homes/$username/google_photo_backup"
+                        val parentPath = file.path.substringBeforeLast('/')
+                        val destFolder = backupRoot + parentPath
                         
-                        // Check if file is already in destination
-                        if (file.path.startsWith(destFolder)) {
+                        // Check if file is already in destination or backup area
+                        if (file.path.startsWith(backupRoot)) {
                             BackupManager.appendLog(" - [Skip Move] File already in backup area: ${file.name}")
                         } else {
                             BackupManager.appendLog(" - [Moving] ${file.path} -> $destFolder")
@@ -427,6 +455,14 @@ class BackupService : Service() {
             if (e is CancellationException) throw e
             e.printStackTrace()
             BackupManager.appendLog("Job Failed: ${e.message}")
+        }
+    }
+
+    private fun formatBytes(bytes: Long): String {
+        return if (bytes >= 0.9 * 1024 * 1024 * 1024) {
+            String.format("%.2f GB", bytes / (1024.0 * 1024.0 * 1024.0))
+        } else {
+            "${bytes / (1024 * 1024)} MB"
         }
     }
 

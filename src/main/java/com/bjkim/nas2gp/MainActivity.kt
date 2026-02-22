@@ -185,9 +185,10 @@ fun SynologyDownloaderApp(repository: SynologyRepository) {
     // Actually, let's mix them.
     var localStatusMessage by remember { mutableStateOf("Ready") }
     val serviceStatusMessage by com.bjkim.nas2gp.service.BackupManager.statusMessage.collectAsState()
-    
-    // Derived status: if backup running, show service status, else local
-    val statusMessage = if (isBackupRunning) serviceStatusMessage else localStatusMessage
+    val backupProgress by com.bjkim.nas2gp.service.BackupManager.progress.collectAsState()
+    val backupTotalBytesTarget by com.bjkim.nas2gp.service.BackupManager.totalBytesTarget.collectAsState()
+    val backupTotalBytesProcessed by com.bjkim.nas2gp.service.BackupManager.totalBytesProcessed.collectAsState()
+    val backupEtaString by com.bjkim.nas2gp.service.BackupManager.etaString.collectAsState()
     
     // Debug Log: Service log + Local log?
     // Let's use BackupManager.debugLog as the source of truth if possible, or just append local logs to it.
@@ -327,6 +328,13 @@ fun SynologyDownloaderApp(repository: SynologyRepository) {
 
     // Queue processor removed (handled by Service)
 
+    private fun formatBytes(bytes: Long): String {
+        return if (bytes >= 0.9 * 1024 * 1024 * 1024) {
+            String.format("%.2f GB", bytes / (1024.0 * 1024.0 * 1024.0))
+        } else {
+            "${bytes / (1024 * 1024)} MB"
+        }
+    }
 
     Column(modifier = Modifier.padding(16.dp)) {
         if (!isLoggedIn) {
@@ -649,7 +657,35 @@ fun SynologyDownloaderApp(repository: SynologyRepository) {
             }
 
             Spacer(modifier = Modifier.height(16.dp))
-            Text(text = statusMessage)
+            val displayStatus = if (isBackupRunning) serviceStatusMessage else localStatusMessage
+            Text(text = displayStatus)
+            
+            if (isBackupRunning) {
+                Spacer(modifier = Modifier.height(8.dp))
+                LinearProgressIndicator(
+                    progress = backupProgress / 100f,
+                    modifier = Modifier.fillMaxWidth().height(8.dp)
+                )
+                Row(
+                    modifier = Modifier.fillMaxWidth().padding(top = 4.dp),
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    val processedStr = if (backupTotalBytesProcessed >= 0.9 * 1024 * 1024 * 1024) {
+                        String.format("%.2f GB", backupTotalBytesProcessed / (1024.0 * 1024.0 * 1024.0))
+                    } else {
+                        "${backupTotalBytesProcessed / (1024 * 1024)} MB"
+                    }
+                    val totalStr = if (backupTotalBytesTarget >= 0.9 * 1024 * 1024 * 1024) {
+                        String.format("%.2f GB", backupTotalBytesTarget / (1024.0 * 1024.0 * 1024.0))
+                    } else {
+                        "${backupTotalBytesTarget / (1024 * 1024)} MB"
+                    }
+                    Text("$processedStr / $totalStr", style = MaterialTheme.typography.labelSmall)
+                    if (backupEtaString.isNotEmpty()) {
+                        Text("ETA: $backupEtaString", style = MaterialTheme.typography.labelSmall)
+                    }
+                }
+            }
             Spacer(modifier = Modifier.height(8.dp))
             
             // Debug Log UI

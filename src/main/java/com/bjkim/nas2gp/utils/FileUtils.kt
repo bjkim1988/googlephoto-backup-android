@@ -56,7 +56,7 @@ fun findFileInMediaStore(context: Context, fileName: String, subDir: String): Lo
     return null
 }
 
-suspend fun saveToMediaStore(context: Context, inputStream: InputStream, fileName: String, subDir: String, expectedSize: Long, lastModified: Long? = null, atomicReplace: Boolean = false, onLog: (String) -> Unit = {}): Boolean {
+suspend fun saveToMediaStore(context: Context, inputStream: InputStream, fileName: String, subDir: String, expectedSize: Long, lastModified: Long? = null, atomicReplace: Boolean = false, onLog: (String) -> Unit = {}, onProgress: (Long) -> Unit = {}): Boolean {
     val ext = fileName.substringAfterLast('.', "").lowercase(Locale.ROOT)
     val isImage = ext in setOf("jpg", "jpeg", "png", "webp", "heic")
     val isMp4Video = ext in setOf("mp4", "mov")
@@ -141,7 +141,12 @@ suspend fun saveToMediaStore(context: Context, inputStream: InputStream, fileNam
                 if (uri == null) return@withContext false
                 
                 resolver.openOutputStream(uri)?.use { outputStream ->
-                    inputStream.copyTo(outputStream)
+                    val buffer = ByteArray(8 * 1024)
+                    var bytesRead: Int
+                    while (inputStream.read(buffer).also { bytesRead = it } != -1) {
+                        outputStream.write(buffer, 0, bytesRead)
+                        onProgress(bytesRead.toLong())
+                    }
                 }
                 
                 val updateValues = ContentValues()
@@ -168,7 +173,12 @@ suspend fun saveToMediaStore(context: Context, inputStream: InputStream, fileNam
                     if (backupFile.exists()) backupFile.delete()
                     
                     FileOutputStream(tmpFile).use { outputStream ->
-                        inputStream.copyTo(outputStream)
+                        val buffer = ByteArray(8 * 1024)
+                        var bytesRead: Int
+                        while (inputStream.read(buffer).also { bytesRead = it } != -1) {
+                            outputStream.write(buffer, 0, bytesRead)
+                            onProgress(bytesRead.toLong())
+                        }
                     }
                     
                     if (targetFile.renameTo(backupFile)) {
@@ -196,7 +206,12 @@ suspend fun saveToMediaStore(context: Context, inputStream: InputStream, fileNam
                         onLog("File exists. Overwriting: $fileName")
                     }
                     FileOutputStream(targetFile).use { outputStream ->
-                        inputStream.copyTo(outputStream)
+                        val buffer = ByteArray(8 * 1024)
+                        var bytesRead: Int
+                        while (inputStream.read(buffer).also { bytesRead = it } != -1) {
+                            outputStream.write(buffer, 0, bytesRead)
+                            onProgress(bytesRead.toLong())
+                        }
                     }
 
                     if (lastModified != null && lastModified > 0) {

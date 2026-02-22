@@ -22,6 +22,10 @@ object BackupManager {
     val storageStats = MutableStateFlow<Pair<Long, Long>?>(null)
     val splitThumbnails = MutableStateFlow<List<android.graphics.Bitmap>>(emptyList())
     
+    val totalBytesTarget = MutableStateFlow(0L)
+    val totalBytesProcessed = MutableStateFlow(0L)
+    val etaString = MutableStateFlow("")
+    
     // Config
     var username: String = ""
     var host: String = ""
